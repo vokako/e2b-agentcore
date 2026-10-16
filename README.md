@@ -29,7 +29,7 @@ It reuses the official package wherever it can, so code behaves the same:
 
 ## Quick start
 
-Requires Python >= 3.10, `pip install e2b boto3`, AWS credentials, and a Harness execution role
+Requires Python >= 3.10, `pip install -r requirements.txt`, AWS credentials, and a Harness execution role
 (ECR pull + CloudWatch Logs).
 
 ```python

@@ -1,0 +1,10 @@
+# Python >= 3.10 (required by e2b 2.x and current boto3).
+#
+# e2b: e2b_agentcore subclasses e2b.Template and reuses e2b's result/exception
+# classes, so it depends on SDK internals. Tested against 2.56.0; ~= allows
+# 2.56.x patch releases only. Run tools/api_coverage.py after upgrading.
+e2b~=2.56.0
+
+# boto3: needs the AgentCore Harness APIs (create/update/get/list/delete_harness)
+# and invoke_agent_runtime_command. 1.43.110 is the oldest version verified.
+boto3>=1.43.110
