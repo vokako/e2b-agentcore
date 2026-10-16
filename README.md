@@ -216,3 +216,7 @@ Two AgentCore targets:
 
 Summary: an E2B-style adapter is feasible on top of RT (custom image + command + shell) or CI (files + code).
 Hard gaps: memory pause/snapshot/fork, port forwarding (`get_host`), per-session env/timeout, `watch_dir`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
