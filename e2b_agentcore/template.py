@@ -17,6 +17,7 @@ alias_exists) are replaced with AgentCore versions.
 What happens in Template.build(t, "my-sandbox")
 ------------------------------------------------
  1. ensure_infra()      first build only: create S3 bucket, ECR repo, CodeBuild role/project.
+                        (Runs after steps 2-3, so an invalid template fails before any AWS call.)
  2. _render_dockerfile  turn the E2B instruction list into a Dockerfile (FROM / RUN / COPY /
                         ENV / WORKDIR / USER). The start command is NOT baked in as an
                         ENTRYPOINT: like E2B, we run it ourselves when a sandbox starts.
@@ -39,7 +40,6 @@ environment, so any E2B-style template (e.g. bare Ubuntu with no server) works u
 """
 from __future__ import annotations
 
-import fnmatch
 import glob
 import io
 import os
@@ -53,7 +53,7 @@ from typing import Callable, List, Optional, Union
 import e2b
 from e2b import BuildException, BuildInfo, LogEntry, TemplateException
 from e2b.template.types import BuildStatusReason, TemplateBuildStatus, TemplateBuildStatusResponse
-from e2b.template.utils import read_dockerignore
+from e2b.template.utils import get_all_files_in_path, read_dockerignore
 
 from ._config import Config, ensure_infra
 from ._errors import aws_errors, not_supported
@@ -242,12 +242,14 @@ def start_image_build(cfg: Config, template, alias: str, skip_cache: bool = Fals
     Returns (codebuild_build_id, image_uri). Also used by runtime/build.py, which only
     needs the image (for a plain AgentCore Runtime) and no Harness.
     """
+    # Steps 2-3 first: E2B instruction list -> Dockerfile -> context zip. Done before any
+    # AWS call so an invalid template fails without touching the account.
+    dockerfile = _render_dockerfile(template, include_start_cmd, cfg.dockerhub_mirror)
+    body = _zip_context(template, dockerfile)
+
     # Step 1: one-time infra (no-op after the first build).
     ensure_infra(cfg, log=log)
 
-    # Step 2-3: E2B instruction list -> Dockerfile -> context zip.
-    dockerfile = _render_dockerfile(template, include_start_cmd)
-    body = _zip_context(template, dockerfile)
     # Unique, sortable image tag per build, e.g. ubuntu24-base-20261015092700.
     tag = f"{re.sub(r'[^a-zA-Z0-9_.-]', '-', alias)}-{time.strftime('%Y%m%d%H%M%S')}"
     image = f"{cfg.registry}/{cfg.ecr_repo}:{tag}"
@@ -295,7 +297,22 @@ def _last(tpl, kind: str) -> Optional[str]:
     return vals[-1] if vals else None
 
 
-def _render_dockerfile(template, include_start_cmd: bool = False) -> str:
+def mirror_image(image: str, mirror: str) -> str:
+    """Docker official image (`ubuntu:24.04`, `library/python:3.12`) -> same image on `mirror`.
+
+    Anything with a registry host (`public.ecr.aws/...`, `localhost:5000/x`) or a Docker Hub
+    namespace (`user/repo`) is returned unchanged: the mirror only carries official images.
+    """
+    if not mirror:
+        return image
+    if image.startswith("library/"):
+        image = image[len("library/"):]
+    if "/" in image:
+        return image
+    return f"{mirror.rstrip('/')}/{image}"
+
+
+def _render_dockerfile(template, include_start_cmd: bool = False, mirror: str = "") -> str:
     """E2B instructions -> Dockerfile text.
 
     Like e2b.Template.to_dockerfile, but keeps COPY's owner/mode (--chown/--chmod, needs
@@ -308,11 +325,15 @@ def _render_dockerfile(template, include_start_cmd: bool = False) -> str:
         raise TemplateException("from_template() bases live in E2B's cloud; use a Docker image or Dockerfile")
     if tpl._base_image is None:
         raise TemplateException("no base image: call from_image / from_ubuntu_image / from_dockerfile first")
-    lines = [f"FROM {tpl._base_image}"]
+    lines = [f"FROM {mirror_image(tpl._base_image, mirror)}"]
     for ins in tpl._instructions:
         kind, args = ins["type"].value, ins["args"]
         if kind == "RUN":
-            lines.append(f"RUN {args[0]}")
+            # args[1], when present, is the user the step should run as (run_cmd(user=...)).
+            if len(args) > 1 and args[1]:
+                lines += [f"USER {args[1]}", f"RUN {args[0]}", "USER root"]
+            else:
+                lines.append(f"RUN {args[0]}")
         elif kind == "COPY":
             src, dest = args[0], args[1]
             owner = args[2] if len(args) > 2 and args[2] else None
@@ -333,7 +354,11 @@ def _render_dockerfile(template, include_start_cmd: bool = False) -> str:
 
 
 def _env_quote(v: str) -> str:
-    return v if re.fullmatch(r"[A-Za-z0-9_./:@,+-]*", v) else '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """Literal ENV value. Docker expands $VAR even inside double quotes, so `$` is escaped too:
+    E2B's set_envs values are plain strings, not shell expressions."""
+    if re.fullmatch(r"[A-Za-z0-9_./:@,+-]*", v):
+        return v
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
 
 
 def _zip_context(template, dockerfile: str) -> bytes:
@@ -344,10 +369,9 @@ def _zip_context(template, dockerfile: str) -> bytes:
     """
     tpl = template._template
     ctx = tpl._file_context_path
+    # e2b's own matcher: .dockerignore semantics (patterns anchored at the context root, a
+    # matched directory excludes everything under it, `!` re-includes, last match wins).
     ignore = list(tpl._file_ignore_patterns or []) + read_dockerignore(ctx)
-
-    def ignored(rel):
-        return any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(rel, p.rstrip("/") + "/*") for p in ignore)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -355,17 +379,13 @@ def _zip_context(template, dockerfile: str) -> bytes:
         for ins in tpl._instructions:
             if ins["type"].value != "COPY":
                 continue
-            matches = glob.glob(os.path.join(ctx, ins["args"][0]))
-            if not matches:
+            if not glob.glob(os.path.join(ctx, ins["args"][0])):
                 raise TemplateException(f"COPY source not found under {ctx}: {ins['args'][0]}")
-            for m in matches:
-                files = [m] if os.path.isfile(m) else [
-                    os.path.join(root, f) for root, _dirs, fs in os.walk(m) for f in fs]
-                for full in files:
-                    rel = os.path.relpath(full, ctx)
-                    if rel not in added and not ignored(rel):
-                        z.write(full, rel)
-                        added.add(rel)
+            for full in get_all_files_in_path(ins["args"][0], ctx, ignore, include_directories=False):
+                rel = os.path.relpath(full, ctx).replace(os.sep, "/")
+                if rel not in added and not os.path.isdir(full):
+                    z.write(full, rel)
+                    added.add(rel)
         z.writestr(DOCKERFILE_NAME, dockerfile)
     return buf.getvalue()
 
@@ -390,11 +410,14 @@ def _codebuild_logs(cfg: Config, build: dict, offset: int) -> List[LogEntry]:
 
 
 def find_harness(cfg: Config, name: str):
+    """The Harness called `name`, or None. A Harness being deleted counts as gone: AgentCore
+    keeps it in DELETING for several minutes, and it can neither run sandboxes nor be
+    deleted again."""
     cp, token = cfg.client("bedrock-agentcore-control"), None
     while True:
         page = cp.list_harnesses(**({"nextToken": token} if token else {}))
         for h in page.get("harnesses", []):
-            if h.get("harnessName") == name:
+            if h.get("harnessName") == name and h.get("status") != "DELETING":
                 return h
         token = page.get("nextToken")
         if not token:

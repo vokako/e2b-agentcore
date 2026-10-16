@@ -18,6 +18,7 @@
  * What happens in Template.build(t, 'my-sandbox')
  * ------------------------------------------------
  *  1. ensureInfra()      first build only: create S3 bucket, ECR repo, CodeBuild role/project.
+ *                        (Runs after steps 2-3, so an invalid template fails before any AWS call.)
  *  2. renderDockerfile   turn the E2B instruction list into a Dockerfile (FROM / RUN / COPY /
  *                        ENV / WORKDIR / USER). The start command is NOT baked in as an
  *                        ENTRYPOINT: like E2B, we run it ourselves when a sandbox starts.
@@ -349,12 +350,14 @@ export async function startImageBuild(
   opts: { skipCache?: boolean; log?: (msg: string) => void; includeStartCmd?: boolean } = {},
 ): Promise<{ buildId: string; image: string }> {
   const log = opts.log ?? (() => {})
+  // Steps 2-3 first: E2B instruction list -> Dockerfile -> context zip. Done before any AWS
+  // call so an invalid template fails without touching the account.
+  const dockerfile = renderDockerfile(template, opts.includeStartCmd, cfg.dockerhubMirror)
+  const body = zipContext(template, dockerfile)
+
   // Step 1: one-time infra (no-op after the first build).
   await ensureInfra(cfg, log)
 
-  // Steps 2-3: E2B instruction list -> Dockerfile -> context zip.
-  const dockerfile = renderDockerfile(template, opts.includeStartCmd)
-  const body = zipContext(template, dockerfile)
   // Unique, sortable image tag per build, e.g. ubuntu24-base-20261015092700.
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
   const image = `${await cfg.registry()}/${cfg.ecrRepo}:${alias.replace(/[^a-zA-Z0-9_.-]/g, '-')}-${ts}`
@@ -395,13 +398,24 @@ function lastArg(template: TemplateClass, kind: string): string | undefined {
  * quotes ENV values. The start command is left out by default because Sandbox.create runs it
  * (E2B semantics); includeStartCmd bakes it in as ENTRYPOINT instead.
  */
-export function renderDockerfile(template: TemplateClass, includeStartCmd = false): string {
+/**
+ * Docker official image (`ubuntu:24.04`, `library/python:3.12`) -> same image on `mirror`.
+ * Anything with a registry host or a Docker Hub namespace (`user/repo`) is unchanged: the
+ * mirror only carries official images.
+ */
+export function mirrorImage(image: string, mirror: string): string {
+  if (!mirror) return image
+  const img = image.startsWith('library/') ? image.slice('library/'.length) : image
+  return img.includes('/') ? img : `${mirror.replace(/\/+$/, '')}/${img}`
+}
+
+export function renderDockerfile(template: TemplateClass, includeStartCmd = false, mirror = ''): string {
   const t = internals(template)
   if (t.baseTemplate !== undefined)
     throw new TemplateError('fromTemplate() bases live in E2B\'s cloud; use a Docker image or Dockerfile')
   if (t.baseImage === undefined)
     throw new TemplateError('no base image: call fromImage / fromUbuntuImage / fromDockerfile first')
-  const lines = [`FROM ${t.baseImage}`]
+  const lines = [`FROM ${mirrorImage(t.baseImage, mirror)}`]
   for (const { type, args } of t.instructions) {
     if (type === 'RUN') {
       // args[1], when present, is the user the step should run as.
@@ -426,8 +440,13 @@ export function renderDockerfile(template: TemplateClass, includeStartCmd = fals
   return lines.join('\n') + '\n'
 }
 
+/**
+ * Literal ENV value. Docker expands $VAR even inside double quotes, so `$` is escaped too:
+ * E2B's setEnvs values are plain strings, not shell expressions.
+ */
 function envQuote(v: string): string {
-  return /^[A-Za-z0-9_./:@,+-]*$/.test(v) ? v : '"' + v.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+  if (/^[A-Za-z0-9_./:@,+-]*$/.test(v)) return v
+  return '"' + v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$') + '"'
 }
 
 function readDockerignore(ctx: string): string[] {
@@ -435,6 +454,23 @@ function readDockerignore(ctx: string): string[] {
   if (!fs.existsSync(p)) return []
   return fs.readFileSync(p, 'utf-8').replace(/^\uFEFF/, '').split('\n')
     .filter((l) => !l.startsWith('#')).map((l) => l.trim()).filter(Boolean)
+}
+
+/**
+ * .dockerignore semantics, same as e2b's matcher: patterns are anchored at the context root
+ * (a leading `/` is dropped), a pattern matching a directory excludes everything under it,
+ * `!` re-includes, and the last matching pattern wins.
+ */
+export function isIgnored(rel: string, patterns: string[]): boolean {
+  const parts = rel.split('/')
+  let ignored = false
+  for (const raw of patterns) {
+    const negated = raw.startsWith('!')
+    const pat = (negated ? raw.slice(1) : raw).trim().replace(/^\/+/, '').replace(/\/+$/, '')
+    if (!pat) continue
+    if (parts.some((_, i) => minimatch(parts.slice(0, i + 1).join('/'), pat, { dot: true }))) ignored = !negated
+  }
+  return ignored
 }
 
 /**
@@ -459,8 +495,7 @@ export function zipContext(template: TemplateClass, dockerfile: string): Uint8Ar
       for (const full of list) {
         const rel = path.relative(ctx, full).split(path.sep).join('/')
         if (rel in files) continue
-        if (ignore.some((p) => minimatch(rel, p, { dot: true }) || minimatch(rel, p.replace(/\/$/, '') + '/**', { dot: true })))
-          continue
+        if (isIgnored(rel, ignore)) continue
         files[rel] = fs.readFileSync(full)
       }
     }
@@ -489,11 +524,15 @@ async function codebuildLogs(cfg: Config, build: Build, offset: number): Promise
   return events.slice(offset).map((e) => new LogEntry(new Date(e.timestamp ?? Date.now()), 'info', (e.message ?? '').trimEnd()))
 }
 
+/**
+ * The Harness called `name`, or undefined. A Harness being deleted counts as gone: AgentCore
+ * keeps it in DELETING for several minutes, and it can neither run sandboxes nor be deleted again.
+ */
 export async function findHarness(cfg: Config, name: string) {
   let token: string | undefined
   for (;;) {
     const page = await cfg.control.send(new ListHarnessesCommand(token ? { nextToken: token } : {}))
-    const h = page.harnesses?.find((x) => x.harnessName === name)
+    const h = page.harnesses?.find((x) => x.harnessName === name && x.status !== 'DELETING')
     if (h) return h as { harnessId: string; harnessName: string; arn?: string }
     token = page.nextToken
     if (!token) return undefined
