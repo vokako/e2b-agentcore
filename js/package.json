@@ -1,0 +1,44 @@
+{
+  "name": "e2b-agentcore",
+  "version": "0.1.0",
+  "description": "AgentCore provider for the official E2B JS/TS SDK: build E2B templates into Amazon Bedrock AgentCore Harnesses and run sandboxes on them",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "coverage": "npm run build && node dist/tools/api-coverage.js",
+    "e2e": "npm run build && node dist/test/e2e.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-agentcore": "^3.1152.0",
+    "@aws-sdk/client-bedrock-agentcore-control": "^3.1152.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.1152.0",
+    "@aws-sdk/client-codebuild": "^3.1152.0",
+    "@aws-sdk/client-ecr": "^3.1152.0",
+    "@aws-sdk/client-iam": "^3.1152.0",
+    "@aws-sdk/client-s3": "^3.1152.0",
+    "@aws-sdk/client-sts": "^3.1152.0",
+    "e2b": "~2.56.0",
+    "fflate": "^0.8.2",
+    "glob": "^13.0.6",
+    "minimatch": "^10.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "~5.9.0"
+  }
+}
