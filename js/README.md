@@ -75,6 +75,10 @@ as soon as it is created (as e2b's JS handle does), so `onStdout`/`onStderr` fir
 - `src/template.ts`: the 7 build steps, with comments at each step
 - `src/sandbox.ts`: sandbox, commands, files and the InvokeAgentRuntimeCommand transport
 - `src/config.ts`: configuration, the CodeBuild buildspec and one-time infrastructure
-- `test/e2e.ts`: `offline`, `build` and `run` test stages
+- `test/e2e.ts`: quick end-to-end smoke test (`offline`, `build`, `run` stages)
+- `test/full.ts`: full test, one or more checks per support-table row; fails if any row is
+  untested. `npm run test:full -- all` (or `offline` / `build` / `run`). Last run
+  (2026-10-16, us-east-2): 139 passed, 0 failed, 76/76 rows covered.
+- `test/interop.ts`: helper the Python full test calls for the cross-language checks
 - `tools/api-coverage.ts`: the support table
 - `examples/build-and-run.ts`

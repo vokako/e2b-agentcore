@@ -21,7 +21,8 @@
   "scripts": {
     "build": "tsc -p .",
     "coverage": "npm run build && node dist/tools/api-coverage.js",
-    "e2e": "npm run build && node dist/test/e2e.js"
+    "e2e": "npm run build && node dist/test/e2e.js",
+    "test:full": "npm run build && node dist/test/full.js"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-agentcore": "^3.1152.0",

@@ -11,6 +11,8 @@ e.g. AWS_PROFILE) plus a few env vars, so the package works in any account:
                                 requires one, but this provider never calls the model: it only
                                 uses the Harness as a sandbox (its microVM + shell commands).
   E2B_AGENTCORE_PREFIX          name prefix for every resource created here (default e2b-agentcore)
+  E2B_AGENTCORE_DOCKERHUB_MIRROR  where Docker official images are pulled from during builds
+                                (default public.ecr.aws/docker/library; "" = Docker Hub)
 
 Resources created on the first Template.build (see ensure_infra):
 
@@ -49,6 +51,11 @@ class Config:
     # so these apply to every sandbox of every template built with this config.
     idle_timeout_s: int = int(os.environ.get("E2B_AGENTCORE_IDLE_TIMEOUT", "900"))
     max_lifetime_s: int = int(os.environ.get("E2B_AGENTCORE_MAX_LIFETIME", "28800"))
+    # Docker Hub rate-limits anonymous pulls (429), and CodeBuild hosts share IPs, so official
+    # images (FROM ubuntu:24.04, python:3.12, ...) are pulled from AWS's mirror of them on ECR
+    # Public instead. Images with a registry or a namespace (user/repo) are left alone.
+    # Set E2B_AGENTCORE_DOCKERHUB_MIRROR="" to pull from Docker Hub directly.
+    dockerhub_mirror: str = os.environ.get("E2B_AGENTCORE_DOCKERHUB_MIRROR", "public.ecr.aws/docker/library")
 
     @cached_property
     def session(self):

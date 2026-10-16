@@ -68,24 +68,31 @@ def status(ours, name):
     return "yes", ""
 
 
-rows = []
-for label, theirs, ours in PAIRS:
-    for n in public(theirs):
-        s, why = status(ours, n)
-        rows.append((f"{label}.{n}", s, why))
-for n in TEMPLATE_METHODS:
-    s, why = status(ac.Template, n)
-    rows.append((f"Template.{n}", s, why))
-rows.append(("Template.from_* / apt_install / copy / run_cmd / set_* ...", "yes", "official e2b builder, inherited"))
+def rows():
+    """Every table row as (name, status, note); status is yes / partial / no / missing.
 
-from importlib.metadata import version  # noqa: E402
+    Used by tests/test_full.py, which requires one test per row."""
+    out = []
+    for label, theirs, ours in PAIRS:
+        for n in public(theirs):
+            out.append((f"{label}.{n}", *status(ours, n)))
+    for n in TEMPLATE_METHODS:
+        out.append((f"Template.{n}", *status(ac.Template, n)))
+    out.append(("Template.from_* / apt_install / copy / run_cmd / set_* ...", "yes", "official e2b builder, inherited"))
+    return [(name, "partial", PARTIAL[name]) if s == "yes" and name in PARTIAL else (name, s, why)
+            for name, s, why in out]
 
-print(f"e2b {version('e2b')}\n")
-print("| E2B method | AgentCore | Notes |\n|---|---|---|")
-for name, s, why in rows:
-    if s == "yes" and name in PARTIAL:
-        s, why = "partial", PARTIAL[name]
-    print(f"| `{name}` | {s} | {why} |")
-counts = {k: sum(1 for r in rows if (('partial' if r[1] == 'yes' and r[0] in PARTIAL else r[1]) == k))
-          for k in ("yes", "partial", "no", "missing")}
-print(f"\n{counts}")
+
+def main():
+    from importlib.metadata import version
+
+    table = rows()
+    print(f"e2b {version('e2b')}\n")
+    print("| E2B method | AgentCore | Notes |\n|---|---|---|")
+    for name, s, why in table:
+        print(f"| `{name}` | {s} | {why} |")
+    print(f"\n{ {k: sum(1 for r in table if r[1] == k) for k in ('yes', 'partial', 'no', 'missing')} }")
+
+
+if __name__ == "__main__":
+    main()

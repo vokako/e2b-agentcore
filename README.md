@@ -57,9 +57,18 @@ with Sandbox.create("dsl-demo", envs={"FOO": "1"}, metadata={"user": "alice"}) a
 ```bash
 export E2B_AGENTCORE_EXEC_ROLE_ARN=arn:aws:iam::<acct>:role/<harness-exec-role>
 python examples/build_and_run.py Dockerfile.fixed ubuntu24-base
-python tests/e2e.py build && python tests/e2e.py run     # full end-to-end test
+python tests/e2e.py build && python tests/e2e.py run     # quick end-to-end smoke test
+python tests/test_full.py all                            # full test: every support-table row (~10 min)
 python tools/api_coverage.py                             # support table below, from the installed e2b
 ```
+
+`tests/test_full.py` is driven by the support table: `tools/api_coverage.py` generates the table
+from the installed `e2b`, every check names the rows it covers, and the run fails if any row has no
+check. Each check tests what its row says: `yes` works as in E2B, `partial` shows the difference
+written in the Notes column, `no` raises `NotSupportedException`. Stages: `offline` (no resources
+created), `build` (templates `full-py`, a deliberately broken one, and one that is deleted again),
+`run` (sandboxes). With `js/dist` built it also checks that Python and JS share templates and
+sandboxes. Last run (2026-10-16, us-east-2): 130 passed, 0 failed, 61/61 rows covered.
 
 Env vars: `E2B_AGENTCORE_REGION` (default us-east-2), `E2B_AGENTCORE_EXEC_ROLE_ARN` (required for builds),
 `E2B_AGENTCORE_MODEL_ID` (the Harness API requires one; never called), `E2B_AGENTCORE_PREFIX`

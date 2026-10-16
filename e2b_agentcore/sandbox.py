@@ -60,15 +60,29 @@ def _now() -> datetime:
 
 
 class _Either:
-    """Like e2b's class_method_variant: `sbx.kill()` and `Sandbox.kill(sandbox_id)` both work."""
+    """Like e2b's class_method_variant: `sbx.kill()` and `Sandbox.kill(sandbox_id)` both work.
 
-    def __init__(self, fn):
-        self.fn = fn
+    `missing` is what the class-level call returns for an unknown sandbox id instead of
+    raising SandboxNotFoundException (E2B's Sandbox.kill(id) returns False)."""
+
+    _RAISE = object()
+
+    def __init__(self, fn, missing=_RAISE):
+        self.fn, self.missing = fn, missing
 
     def __get__(self, obj, cls):
         if obj is not None:
             return lambda *a, **k: self.fn(obj, *a, **k)
-        return lambda sandbox_id, *a, **k: self.fn(cls._from_registry(sandbox_id, k.get("config")), *a, **k)
+
+        def on_class(sandbox_id, *a, **k):
+            try:
+                sbx = cls._from_registry(sandbox_id, k.get("config"))
+            except SandboxNotFoundException:
+                if self.missing is _Either._RAISE:
+                    raise
+                return self.missing
+            return self.fn(sbx, *a, **k)
+        return on_class
 
 
 # ============================================================================ commands
@@ -494,7 +508,7 @@ class Sandbox:
         self._cfg.delete_json(f"sandboxes/{self.sandbox_id}.json")
         return stopped
 
-    kill = _Either(_kill)           # sbx.kill() or Sandbox.kill(sandbox_id)
+    kill = _Either(_kill, missing=False)   # sbx.kill() or Sandbox.kill(sandbox_id); unknown id -> False
 
     def _set_timeout(self, timeout: int, **_ignored) -> None:
         warnings.warn("set_timeout has no effect on AgentCore: idle timeout / max lifetime are per Harness "

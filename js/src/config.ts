@@ -17,6 +17,8 @@
  *   E2B_AGENTCORE_PREFIX          name prefix for every resource created here (default e2b-agentcore)
  *   E2B_AGENTCORE_IDLE_TIMEOUT    Harness idle session timeout in seconds (default 900)
  *   E2B_AGENTCORE_MAX_LIFETIME    Harness max session lifetime in seconds (default 28800)
+ *   E2B_AGENTCORE_DOCKERHUB_MIRROR  where Docker official images are pulled from during builds
+ *                                 (default public.ecr.aws/docker/library; "" = Docker Hub)
  *
  * Resources created on the first Template.build (see ensureInfra):
  *
@@ -50,6 +52,7 @@ export interface ConfigOpts {
   prefix?: string
   idleTimeoutS?: number
   maxLifetimeS?: number
+  dockerhubMirror?: string
 }
 
 /** Error-code helper for AWS SDK v3 errors (they carry `name`, sometimes `Code`). */
@@ -70,7 +73,11 @@ export class Config {
   // so these apply to every sandbox of every template built with this config.
   readonly idleTimeoutS: number
   readonly maxLifetimeS: number
-
+  // Docker Hub rate-limits anonymous pulls (429), and CodeBuild hosts share IPs, so official
+  // images (FROM ubuntu:24.04, python:3.12, ...) are pulled from AWS's mirror of them on ECR
+  // Public instead. Images with a registry or a namespace (user/repo) are left alone.
+  // E2B_AGENTCORE_DOCKERHUB_MIRROR="" pulls from Docker Hub directly.
+  readonly dockerhubMirror: string
   private _account?: Promise<string>
   private _clients = new Map<string, unknown>()
 
@@ -82,6 +89,7 @@ export class Config {
     this.prefix = opts.prefix ?? env.E2B_AGENTCORE_PREFIX ?? 'e2b-agentcore'
     this.idleTimeoutS = opts.idleTimeoutS ?? Number(env.E2B_AGENTCORE_IDLE_TIMEOUT ?? 900)
     this.maxLifetimeS = opts.maxLifetimeS ?? Number(env.E2B_AGENTCORE_MAX_LIFETIME ?? 28800)
+    this.dockerhubMirror = opts.dockerhubMirror ?? env.E2B_AGENTCORE_DOCKERHUB_MIRROR ?? 'public.ecr.aws/docker/library'
   }
 
   /** One cached client per service, all in this config's region. */
