@@ -4,6 +4,10 @@ Write E2B code and run it on Amazon Bedrock AgentCore. Templates are built from 
 (or E2B's template DSL) into an arm64 image and deployed as an AgentCore **Harness**; each
 sandbox is one AgentCore Runtime session (microVM).
 
+Two SDKs, same AWS resources and records, so templates and sandboxes are shared between them:
+- **Python**: this directory (`e2b_agentcore/`), on top of the `e2b` Python package.
+- **JS/TS**: [`js/`](js/README.md), on top of the `e2b` npm package.
+
 ## How it plugs into E2B
 
 The official `e2b` SDK has no provider/plugin interface: `e2b.Sandbox` always talks to E2B's
