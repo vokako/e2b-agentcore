@@ -27,9 +27,12 @@
  *  4. upload to S3       s3://<bucket>/contexts/<alias>/<uuid>.zip (expires after 7 days)
  *  5. CodeBuild          native arm64 `docker build`, then push to ECR as
  *                        <registry>/<prefix>/templates:<alias>-<YYYYmmddHHMMSS>
- *  6. Harness            CreateHarness (first build) or UpdateHarness (rebuild) named
- *                        e2b_<alias>, with the new image as its environment. We poll until it
- *                        is READY and serving the new image.
+ *  6. deploy             V1 (default): CreateHarness (first build) or UpdateHarness (rebuild)
+ *                        named e2b_<alias>, with the new image as its environment.
+ *                        V2 (Config platformVersion 'V2'): CreateAgentRuntime /
+ *                        UpdateAgentRuntime named e2b_<alias> with platformVersion=V2 and the
+ *                        image as the runtime container. We poll until it is READY and serving
+ *                        the new image.
  *  7. template record    s3://<bucket>/templates/<alias>.json keeps the E2B-only settings
  *                        (start cmd, ready cmd, workdir) that Sandbox.create needs.
  *
@@ -37,9 +40,18 @@
  * build record (builds/<id>.json) means another process holding only the BuildInfo can poll
  * getBuildStatus and finish steps 6-7.
  *
- * Why a Harness and not a plain AgentCore Runtime? A Runtime requires the image to run an
- * HTTP server on :8080 (/ping, /invocations). A Harness uses the image only as the sandbox
- * environment, so any E2B-style template (e.g. bare Ubuntu with no server) works unchanged.
+ * Why a Harness by default, and not a plain AgentCore Runtime? A Runtime requires the image
+ * to run an HTTP server on :8080 (/ping, /invocations). A Harness uses the image only as the
+ * sandbox environment, so any E2B-style template (e.g. bare Ubuntu with no server) works
+ * unchanged.
+ *
+ * Why V2 is a plain Runtime: CreateHarness / UpdateHarness have no platformVersion field, and
+ * the runtime a Harness creates behind the scenes is always V1. So for V2 we deploy our own
+ * Runtime and make the image meet the Runtime contract ourselves: the generated Dockerfile
+ * gets an extra build stage that compiles SERVER_GO (a ~20-line static Go server answering
+ * /ping and /invocations) and copies the binary in as the ENTRYPOINT. The user's image needs
+ * no Python, Node or anything else for this. Commands and files still go through
+ * InvokeAgentRuntimeCommand exactly as on V1, so Sandbox code is identical on both.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -56,12 +68,72 @@ import { BatchGetBuildsCommand, StartBuildCommand, type Build } from '@aws-sdk/c
 import { GetLogEventsCommand } from '@aws-sdk/client-cloudwatch-logs'
 import {
   CreateHarnessCommand, UpdateHarnessCommand, GetHarnessCommand, ListHarnessesCommand, DeleteHarnessCommand,
+  CreateAgentRuntimeCommand, UpdateAgentRuntimeCommand, GetAgentRuntimeCommand, ListAgentRuntimesCommand,
+  DeleteAgentRuntimeCommand,
 } from '@aws-sdk/client-bedrock-agentcore-control'
 import { PutObjectCommand } from '@aws-sdk/client-s3'
 import { Config, ensureInfra, sleep } from './config.js'
 import { awsErrors, notSupported, UNSUPPORTED } from './errors.js'
 
 const DOCKERFILE_NAME = 'Dockerfile.e2b' // name of the generated Dockerfile inside the context zip
+export const SERVER_FILE = 'e2b-agentcore-server.go' //   V2 only: source of the :8080 server, inside the zip
+export const SERVER_BIN = '/opt/e2b-agentcore/server' //    V2 only: where the compiled server lives in the image
+export const GO_IMAGE = 'golang:1.24-alpine' //             V2 only: builder stage image (via dockerhubMirror)
+
+/**
+ * The HTTP contract an AgentCore Runtime container must meet: listen on 0.0.0.0:8080, answer
+ * GET /ping (health) and POST /invocations. The server is also PID 1 and reaps orphans. Nothing here runs sandbox commands: those go
+ * through InvokeAgentRuntimeCommand, which AgentCore executes in the container itself.
+ * Built with CGO_ENABLED=0, so the binary is static and runs on any arm64 Linux base image
+ * (glibc, musl or distroless). Byte-identical to SERVER_GO in the Python package.
+ */
+export const SERVER_GO = `package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+)
+
+// As PID 1 the server must reap orphans: background commands are detached (setsid nohup),
+// so when they exit or are killed their parent is gone and they are re-parented to PID 1.
+// Without this they stay zombies, and \`kill -0 <pid>\` keeps reporting them alive.
+func reap() {
+	ch := make(chan os.Signal, 16)
+	signal.Notify(ch, syscall.SIGCHLD)
+	for range ch {
+		for {
+			pid, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
+			if pid <= 0 || err != nil {
+				break
+			}
+		}
+	}
+}
+
+func main() {
+	if os.Getpid() == 1 {
+		go reap()
+	}
+	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(\`{"status":"Healthy"}\`))
+	})
+	http.HandleFunc("/invocations", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"provider": "e2b-agentcore", "arch": runtime.GOARCH,
+			"message":  "sandbox runtime: use InvokeAgentRuntimeCommand for commands and files",
+		})
+	})
+	if err := http.ListenAndServe("0.0.0.0:8080", nil); err != nil {
+		panic(err)
+	}
+}
+`
 
 /** Options every AgentCore method accepts on top of E2B's (E2B connection opts are ignored). */
 export interface AgentCoreOpts {
@@ -87,9 +159,15 @@ export interface BuildOpts extends AgentCoreOpts {
 /** The template record Sandbox.create reads (snake_case, shared with the Python package). */
 export interface TemplateRecord {
   alias: string
-  harness_name: string
-  harness_id: string
-  harness_arn: string
+  /** 'V1' (Harness) or 'V2' (plain Runtime). Records written before V2 support have none. */
+  platform_version?: 'V1' | 'V2'
+  /** The ARN sandbox commands are sent to: the Harness ARN (V1) or the Runtime ARN (V2). */
+  agent_runtime_arn?: string
+  agent_runtime_id?: string
+  agent_runtime_name?: string
+  harness_name?: string
+  harness_id?: string
+  harness_arn?: string
   image: string
   start_cmd?: string | null
   ready_cmd?: string | null
@@ -106,6 +184,7 @@ interface BuildRecord {
   start_cmd?: string | null
   ready_cmd?: string | null
   workdir?: string | null
+  platform_version?: 'V1' | 'V2'
   harness_requested: boolean
   started_at: number
 }
@@ -183,16 +262,24 @@ export class AgentCoreTemplateBase extends TemplateBase {
     if (!cfg.execRoleArn) throw new TemplateError('set E2B_AGENTCORE_EXEC_ROLE_ARN (the Harness execution role)')
     const hname = harnessName(alias) // validate the name before doing any work
     const log = (msg: string) => opts.onBuildLogs?.(new LogEntry(new Date(), 'info', msg))
+    const v2 = cfg.platformVersion === 'V2'
 
     return awsErrors(async () => {
-      const { buildId, image } = await startImageBuild(cfg, template, alias, { skipCache: !!opts.skipCache, log })
+      const prev = await loadTemplate(cfg, alias)
+      const prevPv = prev?.platform_version ?? 'V1'
+      if (prev && prevPv !== cfg.platformVersion)
+        throw new TemplateError(`template '${alias}' was built for platform ${prevPv}; ` +
+          `Template.delete('${alias}') first to rebuild it for ${cfg.platformVersion}`)
+      // V2: the image also gets the :8080 server a plain Runtime needs (see SERVER_GO).
+      const { buildId, image } = await startImageBuild(cfg, template, alias,
+        { skipCache: !!opts.skipCache, log, withServer: v2 })
       // Remember what this build is for, so getBuildStatus() can finish steps 6-7 later,
       // even from another process that only has the BuildInfo.
       const t = internals(template)
       const rec: BuildRecord = {
         alias, harness_name: hname, image, codebuild_id: buildId, start_cmd: t.startCmd ?? null,
         ready_cmd: t.readyCmd ?? null, workdir: lastArg(template, 'WORKDIR') ?? null,
-        harness_requested: false, started_at: now(),
+        platform_version: cfg.platformVersion, harness_requested: false, started_at: now(),
       }
       await cfg.putJson(buildKey(buildId), rec)
       return { templateId: hname, buildId, name: alias, alias, tags: opts.tags ?? [] }
@@ -225,6 +312,8 @@ export class AgentCoreTemplateBase extends TemplateBase {
       if (cb.buildStatus === 'IN_PROGRESS') return resp('building')
       if (cb.buildStatus !== 'SUCCEEDED') return resp('error', `CodeBuild ${cb.id} ${cb.buildStatus}`)
 
+      if (rec.platform_version === 'V2') return runtimeStatus(cfg, rec, data, entries, resp)
+
       // Step 6: point the Harness at the new image (once), then wait for READY.
       if (!rec.harness_requested) {
         await upsertHarness(cfg, rec.harness_name, rec.image)
@@ -244,7 +333,7 @@ export class AgentCoreTemplateBase extends TemplateBase {
       const tpl: TemplateRecord = {
         alias: rec.alias, harness_name: h.harnessName!, harness_id: h.harnessId!, harness_arn: h.arn!,
         image: rec.image, start_cmd: rec.start_cmd, ready_cmd: rec.ready_cmd, workdir: rec.workdir,
-        build_id: data.buildId, built_at: now(),
+        build_id: data.buildId, built_at: now(), platform_version: 'V1', agent_runtime_arn: h.arn!,
       }
       await cfg.putJson(templateKey(rec.alias), tpl)
       entries.push(new LogEntry(new Date(), 'info', `Harness ${h.harnessName} READY (${h.arn})`))
@@ -256,7 +345,9 @@ export class AgentCoreTemplateBase extends TemplateBase {
 
   static override async exists(name: string, opts?: AgentCoreOpts & ConnectionOpts): Promise<boolean> {
     const cfg = opts?.config ?? new Config()
-    return awsErrors(async () => (await findHarness(cfg, harnessName(name))) !== undefined)
+    // Deployed as a Harness (V1) or as a V2 Runtime.
+    return awsErrors(async () => (await findHarness(cfg, harnessName(name))) !== undefined
+      || (await findV2Runtime(cfg, name)) !== undefined)
   }
 
   static override async aliasExists(alias: string, opts?: AgentCoreOpts & ConnectionOpts): Promise<boolean> {
@@ -271,8 +362,10 @@ export class AgentCoreTemplateBase extends TemplateBase {
     const cfg = opts?.config ?? new Config()
     return awsErrors(async () => {
       const h = await findHarness(cfg, harnessName(name))
-      if (!h) return false
-      await cfg.control.send(new DeleteHarnessCommand({ harnessId: h.harnessId }))
+      const rt = await findV2Runtime(cfg, name)
+      if (!h && !rt) return false
+      if (h) await cfg.control.send(new DeleteHarnessCommand({ harnessId: h.harnessId }))
+      if (rt) await cfg.control.send(new DeleteAgentRuntimeCommand({ agentRuntimeId: rt.agentRuntimeId }))
       await cfg.deleteJson(templateKey(name))
       return true
     })
@@ -347,13 +440,13 @@ export const Template = callableTemplate(AgentCoreTemplateBase)
  */
 export async function startImageBuild(
   cfg: Config, template: TemplateClass, alias: string,
-  opts: { skipCache?: boolean; log?: (msg: string) => void; includeStartCmd?: boolean } = {},
+  opts: { skipCache?: boolean; log?: (msg: string) => void; includeStartCmd?: boolean; withServer?: boolean } = {},
 ): Promise<{ buildId: string; image: string }> {
   const log = opts.log ?? (() => {})
   // Steps 2-3 first: E2B instruction list -> Dockerfile -> context zip. Done before any AWS
   // call so an invalid template fails without touching the account.
-  const dockerfile = renderDockerfile(template, opts.includeStartCmd, cfg.dockerhubMirror)
-  const body = zipContext(template, dockerfile)
+  const dockerfile = renderDockerfile(template, opts.includeStartCmd, cfg.dockerhubMirror, opts.withServer)
+  const body = zipContext(template, dockerfile, opts.withServer ? { [SERVER_FILE]: SERVER_GO } : undefined)
 
   // Step 1: one-time infra (no-op after the first build).
   await ensureInfra(cfg, log)
@@ -409,13 +502,22 @@ export function mirrorImage(image: string, mirror: string): string {
   return img.includes('/') ? img : `${mirror.replace(/\/+$/, '')}/${img}`
 }
 
-export function renderDockerfile(template: TemplateClass, includeStartCmd = false, mirror = ''): string {
+/**
+ * withServer (platform V2) puts a builder stage in front that compiles SERVER_GO, then copies
+ * the binary into the final image and makes it the ENTRYPOINT. The template's own start
+ * command is still run by Sandbox.create, not baked in.
+ */
+export function renderDockerfile(template: TemplateClass, includeStartCmd = false, mirror = '', withServer = false): string {
   const t = internals(template)
   if (t.baseTemplate !== undefined)
     throw new TemplateError('fromTemplate() bases live in E2B\'s cloud; use a Docker image or Dockerfile')
   if (t.baseImage === undefined)
     throw new TemplateError('no base image: call fromImage / fromUbuntuImage / fromDockerfile first')
-  const lines = [`FROM ${mirrorImage(t.baseImage, mirror)}`]
+  const lines: string[] = []
+  if (withServer)
+    lines.push(`FROM ${mirrorImage(GO_IMAGE, mirror)} AS e2b_agentcore_server`, `COPY ${SERVER_FILE} /src/main.go`,
+      "RUN cd /src && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /server main.go")
+  lines.push(`FROM ${mirrorImage(t.baseImage, mirror)}`)
   for (const { type, args } of t.instructions) {
     if (type === 'RUN') {
       // args[1], when present, is the user the step should run as.
@@ -436,7 +538,8 @@ export function renderDockerfile(template: TemplateClass, includeStartCmd = fals
   // (e2b's Dockerfile parser appends `USER user` / `WORKDIR /home/user`, E2B's default
   // sandbox user, which a stock image doesn't have.)
   lines.push('USER root')
-  if (includeStartCmd && t.startCmd) lines.push(`ENTRYPOINT ${t.startCmd}`)
+  if (withServer) lines.push(`COPY --from=e2b_agentcore_server /server ${SERVER_BIN}`, `ENTRYPOINT ["${SERVER_BIN}"]`, 'CMD []')
+  else if (includeStartCmd && t.startCmd) lines.push(`ENTRYPOINT ${t.startCmd}`)
   return lines.join('\n') + '\n'
 }
 
@@ -479,7 +582,7 @@ export function isIgnored(rel: string, patterns: string[]): boolean {
  * Paths resolve against the template's fileContextPath (E2B default: the directory of the
  * file that called Template()), and .dockerignore / fileIgnorePatterns apply.
  */
-export function zipContext(template: TemplateClass, dockerfile: string): Uint8Array {
+export function zipContext(template: TemplateClass, dockerfile: string, extra?: Record<string, string>): Uint8Array {
   const t = internals(template)
   const ctx = t.fileContextPath
   const ignore = [...t.fileIgnorePatterns, ...readDockerignore(ctx)]
@@ -501,6 +604,7 @@ export function zipContext(template: TemplateClass, dockerfile: string): Uint8Ar
     }
   }
   files[DOCKERFILE_NAME] = new TextEncoder().encode(dockerfile)
+  for (const [name, content] of Object.entries(extra ?? {})) files[name] = new TextEncoder().encode(content) // V2 server source
   return zipSync(files, { level: 6 })
 }
 
@@ -565,4 +669,83 @@ async function upsertHarness(cfg: Config, name: string, image: string): Promise<
   } else {
     await cfg.control.send(new CreateHarnessCommand({ harnessName: name, ...common, environmentArtifact: artifact } as any))
   }
+}
+
+// ---------------------------------------------------------------------- V2 (plain Runtime)
+
+/**
+ * The V2 Runtime of template `alias`, or undefined. Only the runtime our template record
+ * points at counts, so an unrelated runtime that happens to be called e2b_<alias> is never
+ * touched. Before the record exists (first build still deploying) it falls back to the name.
+ */
+async function findV2Runtime(cfg: Config, alias: string): Promise<{ agentRuntimeId: string } | undefined> {
+  const rec = await loadTemplate(cfg, alias)
+  if (!rec) return runtimeByName(cfg, harnessName(alias))
+  if (rec.platform_version !== 'V2' || !rec.agent_runtime_id) return undefined
+  try {
+    const r = await cfg.control.send(new GetAgentRuntimeCommand({ agentRuntimeId: rec.agent_runtime_id }))
+    return r.status === 'DELETING' ? undefined : { agentRuntimeId: r.agentRuntimeId! }
+  } catch {
+    return undefined
+  }
+}
+
+async function runtimeByName(cfg: Config, name: string) {
+  let token: string | undefined
+  for (;;) {
+    const page = await cfg.control.send(new ListAgentRuntimesCommand({ maxResults: 100, ...(token ? { nextToken: token } : {}) }))
+    const r = page.agentRuntimes?.find((x) => x.agentRuntimeName === name && x.status !== 'DELETING')
+    if (r) return r as { agentRuntimeId: string; agentRuntimeName: string }
+    token = page.nextToken
+    if (!token) return undefined
+  }
+}
+
+/**
+ * Create or update Runtime `name` (platformVersion=V2) so it runs `image`. roleArn /
+ * network / lifecycle are the same settings a V1 Harness gets from Config. V2 snapshots the
+ * microVM at deploy time (the :8080 server must be up for that), and every sandbox session
+ * is restored from that snapshot.
+ */
+async function upsertV2Runtime(cfg: Config, name: string, image: string): Promise<void> {
+  const spec = {
+    agentRuntimeArtifact: { containerConfiguration: { containerUri: image } },
+    roleArn: cfg.execRoleArn, networkConfiguration: { networkMode: 'PUBLIC' },
+    protocolConfiguration: { serverProtocol: 'HTTP' },
+    lifecycleConfiguration: { idleRuntimeSessionTimeout: cfg.idleTimeoutS, maxLifetime: cfg.maxLifetimeS },
+    platformVersion: 'V2',
+  }
+  const existing = await runtimeByName(cfg, name)
+  if (existing) await cfg.control.send(new UpdateAgentRuntimeCommand({ agentRuntimeId: existing.agentRuntimeId, ...spec } as any))
+  else await cfg.control.send(new CreateAgentRuntimeCommand({ agentRuntimeName: name, ...spec } as any))
+}
+
+/** getBuildStatus steps 6-7 for platform V2. */
+async function runtimeStatus(
+  cfg: Config, rec: BuildRecord, data: Pick<BuildInfo, 'templateId' | 'buildId'>, entries: LogEntry[],
+  resp: (status: TemplateBuildStatusResponse['status'], reason?: string) => TemplateBuildStatusResponse,
+): Promise<TemplateBuildStatusResponse> {
+  if (!rec.harness_requested) {
+    await upsertV2Runtime(cfg, rec.harness_name, rec.image)
+    rec.harness_requested = true
+    await cfg.putJson(buildKey(data.buildId), rec)
+    entries.push(new LogEntry(new Date(), 'info', `image pushed; deploying V2 Runtime ${rec.harness_name}`))
+    return resp('building')
+  }
+  const summary = await runtimeByName(cfg, rec.harness_name)
+  const r = summary && (await cfg.control.send(new GetAgentRuntimeCommand({ agentRuntimeId: summary.agentRuntimeId })))
+  if (!r) return resp('error', `Runtime ${rec.harness_name} disappeared`)
+  if (String(r.status).endsWith('FAILED')) return resp('error', `Runtime ${r.status}: ${r.failureReason ?? ''}`)
+  const uri = (r.agentRuntimeArtifact as any)?.containerConfiguration?.containerUri
+  if (r.status !== 'READY' || uri !== rec.image) return resp('building')
+  if ((r as any).platformVersion !== 'V2')
+    return resp('error', `Runtime ${r.agentRuntimeName} is ${(r as any).platformVersion}, not V2`)
+  const tpl: TemplateRecord = {
+    alias: rec.alias, platform_version: 'V2', agent_runtime_name: r.agentRuntimeName!,
+    agent_runtime_id: r.agentRuntimeId!, agent_runtime_arn: r.agentRuntimeArn!, image: rec.image,
+    start_cmd: rec.start_cmd, ready_cmd: rec.ready_cmd, workdir: rec.workdir, build_id: data.buildId, built_at: now(),
+  }
+  await cfg.putJson(templateKey(rec.alias), tpl)
+  entries.push(new LogEntry(new Date(), 'info', `V2 Runtime ${r.agentRuntimeName} READY (${r.agentRuntimeArn})`))
+  return resp('ready')
 }

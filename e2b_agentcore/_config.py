@@ -13,6 +13,16 @@ e.g. AWS_PROFILE) plus a few env vars, so the package works in any account:
   E2B_AGENTCORE_PREFIX          name prefix for every resource created here (default e2b-agentcore)
   E2B_AGENTCORE_DOCKERHUB_MIRROR  where Docker official images are pulled from during builds
                                 (default public.ecr.aws/docker/library; "" = Docker Hub)
+  E2B_AGENTCORE_PLATFORM_VERSION  AgentCore Runtime platform for new builds: V1 (default) or V2.
+                                V1 -> the template is deployed as a Harness (image used as-is).
+                                V2 -> the template is deployed as a plain AgentCore Runtime with
+                                      platformVersion=V2 (MicroVM snapshot / SnapStart). The
+                                      Harness API has no platform field and its backing runtime
+                                      is always V1, so V2 cannot go through a Harness. A Runtime
+                                      needs an HTTP server on :8080, so for V2 the build adds a
+                                      tiny static one to the image (see template.SERVER_GO).
+                                A template keeps the platform it was first built with; to
+                                switch, Template.delete(name) and build again.
 
 Resources created on the first Template.build (see ensure_infra):
 
@@ -56,6 +66,13 @@ class Config:
     # Public instead. Images with a registry or a namespace (user/repo) are left alone.
     # Set E2B_AGENTCORE_DOCKERHUB_MIRROR="" to pull from Docker Hub directly.
     dockerhub_mirror: str = os.environ.get("E2B_AGENTCORE_DOCKERHUB_MIRROR", "public.ecr.aws/docker/library")
+    # "V1" -> Harness backend, "V2" -> plain Runtime with platformVersion=V2. See module docstring.
+    platform_version: str = os.environ.get("E2B_AGENTCORE_PLATFORM_VERSION", "V1")
+
+    def __post_init__(self):
+        self.platform_version = (self.platform_version or "V1").upper()
+        if self.platform_version not in ("V1", "V2"):
+            raise ValueError(f"platform_version must be V1 or V2, got {self.platform_version!r}")
 
     @cached_property
     def session(self):
@@ -170,9 +187,25 @@ def ensure_infra(cfg: Config, log=print) -> None:
         log(f"created bucket {cfg.bucket}")
     # Re-applied every time so buckets created by v1 (which expired everything) get fixed:
     # only build contexts expire; template/sandbox records must stay.
-    s3.put_bucket_lifecycle_configuration(Bucket=cfg.bucket, LifecycleConfiguration={"Rules": [{
-        "ID": "expire-build-contexts", "Status": "Enabled", "Filter": {"Prefix": "contexts/"},
-        "Expiration": {"Days": 7}}]})
+    # Only written when it differs, and retried: S3 aborts concurrent lifecycle writes
+    # (OperationAborted), which happens when several builds start at once.
+    rules = [{"ID": "expire-build-contexts", "Status": "Enabled", "Filter": {"Prefix": "contexts/"},
+              "Expiration": {"Days": 7}}]
+    for attempt in range(6):
+        try:
+            try:
+                current = s3.get_bucket_lifecycle_configuration(Bucket=cfg.bucket).get("Rules", [])
+            except ClientError as exc:
+                if _code(exc) != "NoSuchLifecycleConfiguration":
+                    raise
+                current = []
+            if [{k: r.get(k) for k in ("ID", "Status", "Filter", "Expiration")} for r in current] != rules:
+                s3.put_bucket_lifecycle_configuration(Bucket=cfg.bucket, LifecycleConfiguration={"Rules": rules})
+            break
+        except ClientError as exc:
+            if _code(exc) != "OperationAborted" or attempt == 5:
+                raise
+            time.sleep(2 + attempt * 2)
 
     # 2. ECR repo with scan-on-push. All templates share one repo, one tag per build.
     try:

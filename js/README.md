@@ -53,6 +53,10 @@ execution role, model id, resource prefix, idle timeout, max lifetime), or pass
 `{ config: new Config({...}) }` to any call. See `src/config.ts` for the list and for every AWS
 resource the first build creates.
 
+Platform V2: `new Config({ platformVersion: 'V2' })` or `E2B_AGENTCORE_PLATFORM_VERSION=V2` deploys
+the template as an AgentCore Runtime with `platformVersion=V2` instead of a Harness. Sandbox code is
+unchanged. See "Platform V1 or V2" in the [main README](../README.md) for what differs.
+
 ## Method support
 
 `npm run coverage` prints the full table, generated from the installed `e2b` 2.56.0:
@@ -78,7 +82,7 @@ as soon as it is created (as e2b's JS handle does), so `onStdout`/`onStderr` fir
 - `test/e2e.ts`: quick end-to-end smoke test (`offline`, `build`, `run` stages)
 - `test/full.ts`: full test, one or more checks per support-table row; fails if any row is
   untested. `npm run test:full -- all` (or `offline` / `build` / `run`). Last run
-  (2026-10-16, us-east-2): 139 passed, 0 failed, 76/76 rows covered.
+  (2026-10-20, us-east-2): 151 passed, 0 failed, 76/76 rows covered, on V1 and on V2.
 - `test/interop.ts`: helper the Python full test calls for the cross-language checks
 - `tools/api-coverage.ts`: the support table
 - `examples/build-and-run.ts`
