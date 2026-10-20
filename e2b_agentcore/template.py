@@ -26,17 +26,29 @@ What happens in Template.build(t, "my-sandbox")
  4. upload to S3        s3://<bucket>/contexts/<alias>/<uuid>.zip (expires after 7 days)
  5. CodeBuild           native arm64 `docker build`, then push to ECR as
                         <registry>/<prefix>/templates:<alias>-<YYYYmmddHHMMSS>
- 6. Harness            CreateHarness (first build) or UpdateHarness (rebuild) named
-                        e2b_<alias>, with the new image as its environment. We poll until
-                        it is READY and serving the new image.
+ 6. deploy             V1 (default): CreateHarness (first build) or UpdateHarness (rebuild)
+                        named e2b_<alias>, with the new image as its environment.
+                        V2 (Config.platform_version="V2"): CreateAgentRuntime /
+                        UpdateAgentRuntime named e2b_<alias> with platformVersion=V2 and the
+                        image as the runtime container. We poll until it is READY and
+                        serving the new image.
  7. template record     s3://<bucket>/templates/<alias>.json keeps the E2B-only settings
                         (start cmd, ready cmd, workdir) that Sandbox.create needs.
 
 build() is just build_in_background() + a get_build_status() loop, so both paths share code.
 
-Why a Harness and not a plain AgentCore Runtime? A Runtime requires the image to run an
-HTTP server on :8080 (/ping, /invocations). A Harness uses the image only as the sandbox
-environment, so any E2B-style template (e.g. bare Ubuntu with no server) works unchanged.
+Why a Harness by default, and not a plain AgentCore Runtime? A Runtime requires the image
+to run an HTTP server on :8080 (/ping, /invocations). A Harness uses the image only as the
+sandbox environment, so any E2B-style template (e.g. bare Ubuntu with no server) works
+unchanged.
+
+Why V2 is a plain Runtime: CreateHarness / UpdateHarness have no platformVersion field, and
+the runtime a Harness creates behind the scenes is always V1. So for V2 we deploy our own
+Runtime, and make the image satisfy the Runtime contract ourselves: the generated Dockerfile
+gets an extra build stage that compiles SERVER_GO (a ~20-line static Go server answering
+/ping and /invocations) and copies the binary in as the ENTRYPOINT. The user's image needs
+no Python, Node or anything else for this. Commands and files still go through
+InvokeAgentRuntimeCommand exactly as on V1, so Sandbox code is identical on both.
 """
 from __future__ import annotations
 
@@ -59,6 +71,62 @@ from ._config import Config, ensure_infra
 from ._errors import aws_errors, not_supported
 
 DOCKERFILE_NAME = "Dockerfile.e2b"   # name of the generated Dockerfile inside the context zip
+SERVER_FILE = "e2b-agentcore-server.go"   # V2 only: source of the :8080 server, inside the zip
+SERVER_BIN = "/opt/e2b-agentcore/server"  # V2 only: where the compiled server lives in the image
+GO_IMAGE = "golang:1.24-alpine"           # V2 only: builder stage image (via dockerhub_mirror)
+
+# The HTTP contract an AgentCore Runtime container must meet: listen on 0.0.0.0:8080, answer
+# GET /ping (health) and POST /invocations. The server is also PID 1 and reaps orphans. Nothing here runs sandbox commands: those go
+# through InvokeAgentRuntimeCommand, which AgentCore executes in the container itself.
+# Built with CGO_ENABLED=0, so the binary is static and runs on any arm64 Linux base image
+# (glibc, musl or distroless).
+SERVER_GO = """package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+)
+
+// As PID 1 the server must reap orphans: background commands are detached (setsid nohup),
+// so when they exit or are killed their parent is gone and they are re-parented to PID 1.
+// Without this they stay zombies, and `kill -0 <pid>` keeps reporting them alive.
+func reap() {
+	ch := make(chan os.Signal, 16)
+	signal.Notify(ch, syscall.SIGCHLD)
+	for range ch {
+		for {
+			pid, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil)
+			if pid <= 0 || err != nil {
+				break
+			}
+		}
+	}
+}
+
+func main() {
+	if os.Getpid() == 1 {
+		go reap()
+	}
+	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"Healthy"}`))
+	})
+	http.HandleFunc("/invocations", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"provider": "e2b-agentcore", "arch": runtime.GOARCH,
+			"message":  "sandbox runtime: use InvokeAgentRuntimeCommand for commands and files",
+		})
+	})
+	if err := http.ListenAndServe("0.0.0.0:8080", nil); err != nil {
+		panic(err)
+	}
+}
+"""
 
 
 def harness_name(alias: str) -> str:
@@ -129,11 +197,18 @@ class Template(e2b.Template):
         if not cfg.exec_role_arn:
             raise TemplateException("set E2B_AGENTCORE_EXEC_ROLE_ARN (the Harness execution role)")
         hname = harness_name(alias)  # validate the name before doing any work
+        v2 = cfg.platform_version == "V2"
+        prev = load_template(cfg, alias)
+        if prev and prev.get("platform_version", "V1") != cfg.platform_version:
+            raise TemplateException(
+                f"template {alias!r} was built for platform {prev.get('platform_version', 'V1')}; "
+                f"Template.delete({alias!r}) first to rebuild it for {cfg.platform_version}")
 
         def log(msg, level="info"):
             on_build_logs and on_build_logs(LogEntry(datetime.now(timezone.utc), level, msg))
 
-        build_id, image = start_image_build(cfg, template, alias, skip_cache, log)
+        # V2: the image also gets the :8080 server a plain Runtime needs (see SERVER_GO).
+        build_id, image = start_image_build(cfg, template, alias, skip_cache, log, with_server=v2)
 
         # Remember what this build is for, so get_build_status() can finish steps 6-7
         # later, even from another process that only has the BuildInfo.
@@ -141,6 +216,7 @@ class Template(e2b.Template):
         cfg.put_json(_build_key(build_id), {
             "alias": alias, "harness_name": hname, "image": image, "codebuild_id": build_id,
             "start_cmd": tpl._start_cmd, "ready_cmd": tpl._ready_cmd, "workdir": _last(tpl, "WORKDIR"),
+            "platform_version": cfg.platform_version,
             "harness_requested": False, "started_at": time.time()})
         return BuildInfo(template_id=hname, build_id=build_id, name=alias, alias=alias, tags=tags or [])
 
@@ -175,6 +251,9 @@ class Template(e2b.Template):
         if cb["buildStatus"] != "SUCCEEDED":
             return resp(TemplateBuildStatus.ERROR, f"CodeBuild {cb['id']} {cb['buildStatus']}")
 
+        if rec.get("platform_version", "V1") == "V2":
+            return _runtime_status(cfg, rec, build_info, entries, resp)
+
         # Step 6: point the Harness at the new image (once), then wait for READY.
         cp = cfg.client("bedrock-agentcore-control")
         if not rec["harness_requested"]:
@@ -199,7 +278,7 @@ class Template(e2b.Template):
             "alias": rec["alias"], "harness_name": h["harnessName"], "harness_id": h["harnessId"],
             "harness_arn": h["arn"], "image": rec["image"], "start_cmd": rec["start_cmd"],
             "ready_cmd": rec["ready_cmd"], "workdir": rec["workdir"], "build_id": build_info.build_id,
-            "built_at": time.time()})
+            "platform_version": "V1", "agent_runtime_arn": h["arn"], "built_at": time.time()})
         entries.append(LogEntry(datetime.now(timezone.utc), "info", f"Harness {h['harnessName']} READY ({h['arn']})"))
         return resp(TemplateBuildStatus.READY)
 
@@ -208,7 +287,9 @@ class Template(e2b.Template):
     @classmethod
     @aws_errors
     def exists(cls, name: str, config: Optional[Config] = None, **_ignored) -> bool:
-        return find_harness(config or Config(), harness_name(name)) is not None
+        """True if the template is deployed, as a Harness (V1) or a V2 Runtime."""
+        cfg, n = config or Config(), harness_name(name)
+        return find_harness(cfg, n) is not None or _find_v2_runtime(cfg, name) is not None
 
     @classmethod
     def alias_exists(cls, alias: str, config: Optional[Config] = None, **_ignored) -> bool:
@@ -220,10 +301,14 @@ class Template(e2b.Template):
         """Not in e2b.Template (E2B deletes via CLI); deletes the Harness and template record.
         ECR images are kept."""
         cfg = config or Config()
-        h = find_harness(cfg, harness_name(name))
-        if not h:
+        cp = cfg.client("bedrock-agentcore-control")
+        h, rt = find_harness(cfg, harness_name(name)), _find_v2_runtime(cfg, name)
+        if not h and not rt:
             return False
-        cfg.client("bedrock-agentcore-control").delete_harness(harnessId=h["harnessId"])
+        if h:
+            cp.delete_harness(harnessId=h["harnessId"])
+        if rt:
+            cp.delete_agent_runtime(agentRuntimeId=rt["agentRuntimeId"])
         cfg.delete_json(_template_key(name))
         return True
 
@@ -236,7 +321,7 @@ class Template(e2b.Template):
 # ---------------------------------------------------------------------- helpers
 
 def start_image_build(cfg: Config, template, alias: str, skip_cache: bool = False, log=lambda *_: None,
-                      include_start_cmd: bool = False):
+                      include_start_cmd: bool = False, with_server: bool = False):
     """Steps 1-5: Dockerfile -> context zip -> S3 -> CodeBuild arm64 -> ECR. Non-blocking.
 
     Returns (codebuild_build_id, image_uri). Also used by runtime/build.py, which only
@@ -244,8 +329,8 @@ def start_image_build(cfg: Config, template, alias: str, skip_cache: bool = Fals
     """
     # Steps 2-3 first: E2B instruction list -> Dockerfile -> context zip. Done before any
     # AWS call so an invalid template fails without touching the account.
-    dockerfile = _render_dockerfile(template, include_start_cmd, cfg.dockerhub_mirror)
-    body = _zip_context(template, dockerfile)
+    dockerfile = _render_dockerfile(template, include_start_cmd, cfg.dockerhub_mirror, with_server)
+    body = _zip_context(template, dockerfile, {SERVER_FILE: SERVER_GO} if with_server else None)
 
     # Step 1: one-time infra (no-op after the first build).
     ensure_infra(cfg, log=log)
@@ -312,20 +397,30 @@ def mirror_image(image: str, mirror: str) -> str:
     return f"{mirror.rstrip('/')}/{image}"
 
 
-def _render_dockerfile(template, include_start_cmd: bool = False, mirror: str = "") -> str:
+def _render_dockerfile(template, include_start_cmd: bool = False, mirror: str = "",
+                       with_server: bool = False) -> str:
     """E2B instructions -> Dockerfile text.
 
     Like e2b.Template.to_dockerfile, but keeps COPY's owner/mode (--chown/--chmod, needs
     BuildKit). The start command is left out by default because Sandbox.create runs it
     (E2B semantics); include_start_cmd=True bakes it in as ENTRYPOINT instead, which a
     plain AgentCore Runtime image needs (its server must start with the container).
+
+    with_server=True (platform V2) puts a builder stage in front that compiles SERVER_GO,
+    then copies the binary into the final image and makes it the ENTRYPOINT. The template's
+    own start command is still run by Sandbox.create, not baked in.
     """
     tpl = template._template
     if tpl._base_template is not None:
         raise TemplateException("from_template() bases live in E2B's cloud; use a Docker image or Dockerfile")
     if tpl._base_image is None:
         raise TemplateException("no base image: call from_image / from_ubuntu_image / from_dockerfile first")
-    lines = [f"FROM {mirror_image(tpl._base_image, mirror)}"]
+    lines = []
+    if with_server:
+        lines += [f"FROM {mirror_image(GO_IMAGE, mirror)} AS e2b_agentcore_server",
+                  f"COPY {SERVER_FILE} /src/main.go",
+                  "RUN cd /src && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /server main.go"]
+    lines.append(f"FROM {mirror_image(tpl._base_image, mirror)}")
     for ins in tpl._instructions:
         kind, args = ins["type"].value, ins["args"]
         if kind == "RUN":
@@ -348,7 +443,10 @@ def _render_dockerfile(template, include_start_cmd: bool = False, mirror: str = 
     # (E2B's Dockerfile parser appends `USER user` / `WORKDIR /home/user`, E2B's default
     # sandbox user, which a stock image doesn't have.)
     lines.append("USER root")
-    if include_start_cmd and tpl._start_cmd:
+    if with_server:
+        lines += [f"COPY --from=e2b_agentcore_server /server {SERVER_BIN}",
+                  f'ENTRYPOINT ["{SERVER_BIN}"]', "CMD []"]
+    elif include_start_cmd and tpl._start_cmd:
         lines.append(f"ENTRYPOINT {tpl._start_cmd}")
     return "\n".join(lines) + "\n"
 
@@ -361,7 +459,7 @@ def _env_quote(v: str) -> str:
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
 
 
-def _zip_context(template, dockerfile: str) -> bytes:
+def _zip_context(template, dockerfile: str, extra: Optional[dict] = None) -> bytes:
     """Zip the generated Dockerfile plus only the files that COPY steps reference.
 
     Paths resolve against the template's file_context_path (E2B default: the directory of
@@ -387,6 +485,8 @@ def _zip_context(template, dockerfile: str) -> bytes:
                     z.write(full, rel)
                     added.add(rel)
         z.writestr(DOCKERFILE_NAME, dockerfile)
+        for fname, content in (extra or {}).items():   # generated files (V2 server source)
+            z.writestr(fname, content)
     return buf.getvalue()
 
 
@@ -443,3 +543,83 @@ def _upsert_harness(cfg: Config, name: str, image: str) -> None:
         cp.update_harness(harnessId=existing["harnessId"], **spec)
     else:
         cp.create_harness(harnessName=name, **spec)
+
+
+# ---------------------------------------------------------------------- V2 (plain Runtime)
+
+def _find_v2_runtime(cfg: Config, alias: str):
+    """The V2 Runtime of template `alias`, or None. Only runtimes our template record points
+    at count, so an unrelated runtime that happens to be called e2b_<alias> is never touched."""
+    rec = load_template(cfg, alias)
+    rid = rec and rec.get("platform_version") == "V2" and rec.get("agent_runtime_id")
+    if not rid:
+        # Template record not written yet (first build still deploying): fall back to the name.
+        return _runtime_by_name(cfg, harness_name(alias)) if rec is None else None
+    try:
+        r = cfg.client("bedrock-agentcore-control").get_agent_runtime(agentRuntimeId=rid)
+    except Exception:
+        return None
+    return None if r.get("status") == "DELETING" else r
+
+
+def _runtime_by_name(cfg: Config, name: str):
+    cp, token = cfg.client("bedrock-agentcore-control"), None
+    while True:
+        page = cp.list_agent_runtimes(maxResults=100, **({"nextToken": token} if token else {}))
+        for r in page.get("agentRuntimes", []):
+            if r.get("agentRuntimeName") == name and r.get("status") != "DELETING":
+                return r
+        token = page.get("nextToken")
+        if not token:
+            return None
+
+
+def _upsert_v2_runtime(cfg: Config, name: str, image: str) -> None:
+    """Create or update Runtime `name` (platformVersion=V2) so it runs `image`.
+
+    roleArn / network / lifecycle are the same settings a V1 Harness gets from Config.
+    V2 snapshots the microVM at deploy time (the :8080 server must be up for that), and
+    every sandbox session is restored from that snapshot.
+    """
+    cp = cfg.client("bedrock-agentcore-control")
+    spec = dict(agentRuntimeArtifact={"containerConfiguration": {"containerUri": image}},
+                roleArn=cfg.exec_role_arn, networkConfiguration={"networkMode": "PUBLIC"},
+                protocolConfiguration={"serverProtocol": "HTTP"},
+                lifecycleConfiguration={"idleRuntimeSessionTimeout": cfg.idle_timeout_s,
+                                        "maxLifetime": cfg.max_lifetime_s},
+                platformVersion="V2")
+    existing = _runtime_by_name(cfg, name)
+    if existing:
+        cp.update_agent_runtime(agentRuntimeId=existing["agentRuntimeId"], **spec)
+    else:
+        cp.create_agent_runtime(agentRuntimeName=name, **spec)
+
+
+def _runtime_status(cfg: Config, rec: dict, build_info, entries, resp):
+    """get_build_status steps 6-7 for platform V2."""
+    if not rec["harness_requested"]:
+        _upsert_v2_runtime(cfg, rec["harness_name"], rec["image"])
+        rec["harness_requested"] = True
+        cfg.put_json(_build_key(build_info.build_id), rec)
+        entries.append(LogEntry(datetime.now(timezone.utc), "info",
+                                f"image pushed; deploying V2 Runtime {rec['harness_name']}"))
+        return resp(TemplateBuildStatus.BUILDING)
+    r = _runtime_by_name(cfg, rec["harness_name"])
+    r = r and cfg.client("bedrock-agentcore-control").get_agent_runtime(agentRuntimeId=r["agentRuntimeId"])
+    if not r:
+        return resp(TemplateBuildStatus.ERROR, f"Runtime {rec['harness_name']} disappeared")
+    if r["status"].endswith("FAILED"):
+        return resp(TemplateBuildStatus.ERROR, f"Runtime {r['status']}: {r.get('failureReason')}")
+    uri = r.get("agentRuntimeArtifact", {}).get("containerConfiguration", {}).get("containerUri")
+    if r["status"] != "READY" or uri != rec["image"]:
+        return resp(TemplateBuildStatus.BUILDING)
+    if r.get("platformVersion") != "V2":
+        return resp(TemplateBuildStatus.ERROR, f"Runtime {r['agentRuntimeName']} is {r.get('platformVersion')}, not V2")
+    cfg.put_json(_template_key(rec["alias"]), {
+        "alias": rec["alias"], "platform_version": "V2", "agent_runtime_name": r["agentRuntimeName"],
+        "agent_runtime_id": r["agentRuntimeId"], "agent_runtime_arn": r["agentRuntimeArn"],
+        "image": rec["image"], "start_cmd": rec["start_cmd"], "ready_cmd": rec["ready_cmd"],
+        "workdir": rec["workdir"], "build_id": build_info.build_id, "built_at": time.time()})
+    entries.append(LogEntry(datetime.now(timezone.utc), "info",
+                            f"V2 Runtime {r['agentRuntimeName']} READY ({r['agentRuntimeArn']})"))
+    return resp(TemplateBuildStatus.READY)

@@ -19,6 +19,16 @@
  *   E2B_AGENTCORE_MAX_LIFETIME    Harness max session lifetime in seconds (default 28800)
  *   E2B_AGENTCORE_DOCKERHUB_MIRROR  where Docker official images are pulled from during builds
  *                                 (default public.ecr.aws/docker/library; "" = Docker Hub)
+ *   E2B_AGENTCORE_PLATFORM_VERSION  AgentCore Runtime platform for new builds: V1 (default) or V2.
+ *                                 V1 -> the template is deployed as a Harness (image used as-is).
+ *                                 V2 -> the template is deployed as a plain AgentCore Runtime with
+ *                                       platformVersion=V2 (MicroVM snapshot / SnapStart). The
+ *                                       Harness API has no platform field and its backing runtime
+ *                                       is always V1, so V2 cannot go through a Harness. A Runtime
+ *                                       needs an HTTP server on :8080, so for V2 the build adds a
+ *                                       tiny static one to the image (see template.ts SERVER_GO).
+ *                                 A template keeps the platform it was first built with; to
+ *                                 switch, Template.delete(name) and build again.
  *
  * Resources created on the first Template.build (see ensureInfra):
  *
@@ -34,6 +44,7 @@
 import {
   S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, HeadBucketCommand,
   CreateBucketCommand, PutPublicAccessBlockCommand, PutBucketLifecycleConfigurationCommand,
+  GetBucketLifecycleConfigurationCommand,
   paginateListObjectsV2, type BucketLocationConstraint,
 } from '@aws-sdk/client-s3'
 import { ECRClient, CreateRepositoryCommand } from '@aws-sdk/client-ecr'
@@ -53,6 +64,8 @@ export interface ConfigOpts {
   idleTimeoutS?: number
   maxLifetimeS?: number
   dockerhubMirror?: string
+  /** 'V1' (Harness, default) or 'V2' (plain Runtime with platformVersion=V2). */
+  platformVersion?: 'V1' | 'V2' | string
 }
 
 /** Error-code helper for AWS SDK v3 errors (they carry `name`, sometimes `Code`). */
@@ -78,6 +91,8 @@ export class Config {
   // Public instead. Images with a registry or a namespace (user/repo) are left alone.
   // E2B_AGENTCORE_DOCKERHUB_MIRROR="" pulls from Docker Hub directly.
   readonly dockerhubMirror: string
+  // 'V1' -> Harness backend, 'V2' -> plain Runtime with platformVersion=V2. See the header.
+  readonly platformVersion: 'V1' | 'V2'
   private _account?: Promise<string>
   private _clients = new Map<string, unknown>()
 
@@ -90,6 +105,9 @@ export class Config {
     this.idleTimeoutS = opts.idleTimeoutS ?? Number(env.E2B_AGENTCORE_IDLE_TIMEOUT ?? 900)
     this.maxLifetimeS = opts.maxLifetimeS ?? Number(env.E2B_AGENTCORE_MAX_LIFETIME ?? 28800)
     this.dockerhubMirror = opts.dockerhubMirror ?? env.E2B_AGENTCORE_DOCKERHUB_MIRROR ?? 'public.ecr.aws/docker/library'
+    const pv = String(opts.platformVersion ?? env.E2B_AGENTCORE_PLATFORM_VERSION ?? 'V1').toUpperCase()
+    if (pv !== 'V1' && pv !== 'V2') throw new Error(`platformVersion must be V1 or V2, got '${pv}'`)
+    this.platformVersion = pv
   }
 
   /** One cached client per service, all in this config's region. */
@@ -216,13 +234,26 @@ export async function ensureInfra(cfg: Config, log: (msg: string) => void = cons
     log(`created bucket ${bucket}`)
   }
   // Re-applied every time: only build contexts expire; template/sandbox records must stay.
-  await cfg.s3.send(new PutBucketLifecycleConfigurationCommand({
-    Bucket: bucket, LifecycleConfiguration: {
-      Rules: [{
-        ID: 'expire-build-contexts', Status: 'Enabled', Filter: { Prefix: 'contexts/' }, Expiration: { Days: 7 },
-      }],
-    },
-  }))
+  // Only written when it differs, and retried: S3 aborts concurrent lifecycle writes
+  // (OperationAborted), which happens when several builds start at once.
+  const rules = [{ ID: 'expire-build-contexts', Status: 'Enabled', Filter: { Prefix: 'contexts/' }, Expiration: { Days: 7 } }]
+  for (let attempt = 0; ; attempt++) {
+    try {
+      let current: unknown[] = []
+      try {
+        current = (await cfg.s3.send(new GetBucketLifecycleConfigurationCommand({ Bucket: bucket }))).Rules ?? []
+      } catch (e) {
+        if (awsCode(e) !== 'NoSuchLifecycleConfiguration') throw e
+      }
+      const norm = (current as any[]).map((r) => ({ ID: r.ID, Status: r.Status, Filter: r.Filter, Expiration: r.Expiration }))
+      if (JSON.stringify(norm) !== JSON.stringify(rules))
+        await cfg.s3.send(new PutBucketLifecycleConfigurationCommand({ Bucket: bucket, LifecycleConfiguration: { Rules: rules as any } }))
+      break
+    } catch (e) {
+      if (awsCode(e) !== 'OperationAborted' || attempt === 5) throw e
+      await sleep(2000 + attempt * 2000)
+    }
+  }
 
   // 2. ECR repo with scan-on-push. All templates share one repo, one tag per build.
   try {

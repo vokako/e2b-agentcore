@@ -6,6 +6,10 @@
     python tests/test_full.py run       # sandboxes on full-py (~4 min)
     python tests/test_full.py all       # offline + build + run
 
+    E2B_AGENTCORE_PLATFORM_VERSION=V2 python tests/test_full.py all
+                                        # same suite on platform V2 (plain Runtime with
+                                        # platformVersion=V2); templates get a -v2 suffix
+
 How completeness is enforced: tools/api_coverage.py generates the README's support table
 from the installed e2b package. Every check() names the table rows it covers, and the run
 fails if any row of the table is not covered by at least one check of the stages that ran
@@ -25,6 +29,7 @@ import subprocess
 import sys
 import time
 import warnings
+import zipfile
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,9 +48,11 @@ from e2b_agentcore import Config, Sandbox, Template  # noqa: E402
 from e2b_agentcore.sandbox import CommandHandle  # noqa: E402
 from e2b_agentcore.template import _render_dockerfile, _zip_context, harness_name, mirror_image  # noqa: E402
 
-FULL, BROKEN = "full-py", "full-py-broken"
+PV = Config().platform_version            # V1 (Harness) or V2 (plain Runtime), from the env
+SFX = "" if PV == "V1" else "-v2"         # V1 and V2 suites use separate templates
+FULL, BROKEN = "full-py" + SFX, "full-py-broken" + SFX
 # Unique per run: a deleted Harness stays DELETING for minutes and keeps its name taken.
-DEL = f"full-py-del-{int(time.time()) % 100000}"
+DEL = f"full-py-del{SFX}-{int(time.time()) % 100000}"
 INTEROP = os.path.join(ROOT, "js", "dist", "test", "interop.js")
 ROWS = {name: (status, note) for name, status, note in api_coverage.rows()}
 TEMPLATE_DSL_ROW = "Template.from_* / apt_install / copy / run_cmd / set_* ..."
@@ -115,10 +122,22 @@ def offline():
     check("render: run_cmd(user=) -> USER around RUN",
           "USER nobody\nRUN whoami > /opt/nb/whoami\nUSER root" in df)
     check("render: start cmd not baked in", "ENTRYPOINT" not in df and df.rstrip().endswith("USER root"))
+    v2df = _render_dockerfile(full_template(), with_server=True)
+    check("render V2: Go builder stage first, user image last",
+          v2df.startswith("FROM golang:1.24-alpine AS e2b_agentcore_server\n")
+          and v2df.count("\nFROM ") == 1 and "CGO_ENABLED=0" in v2df)
+    check("render V2: static server is the ENTRYPOINT, start cmd not baked in",
+          v2df.rstrip().endswith('COPY --from=e2b_agentcore_server /server /opt/e2b-agentcore/server\n'
+                                 'ENTRYPOINT ["/opt/e2b-agentcore/server"]\nCMD []'))
+    z = zipfile.ZipFile(io.BytesIO(_zip_context(full_template(), v2df, {ac.template.SERVER_FILE: ac.template.SERVER_GO})))
+    check("zip V2: server source shipped in the build context",
+          ac.template.SERVER_FILE in z.namelist() and b"0.0.0.0:8080" in z.read(ac.template.SERVER_FILE))
+    e = raises(ValueError, lambda: Config(platform_version="V3"))
+    check("Config(platform_version) accepts only V1 / V2", isinstance(e, ValueError)
+          and Config(platform_version="v2").platform_version == "V2")
     check("render: include_start_cmd -> ENTRYPOINT",
           _render_dockerfile(full_template(), include_start_cmd=True).rstrip().endswith(
               "ENTRYPOINT python3 -m http.server 8000"))
-    import zipfile
     names = sorted(zipfile.ZipFile(io.BytesIO(_zip_context(full_template(), df))).namelist())
     check("zip: COPY sources only; .dockerignore and file_ignore_patterns applied",
           names == ["Dockerfile.e2b", "app/keep.txt", "app/sub/nested.txt", "run.sh"], str(names))
@@ -207,19 +226,37 @@ def build():
     bg_broken = Template.build_in_background(broken, BROKEN)
     bg_del = Template.build_in_background(tiny, DEL)
     check("build_in_background returns BuildInfo", isinstance(bg_broken, e2b.BuildInfo)
-          and bg_broken.template_id == "e2b_full_py_broken", covers=["Template.build_in_background"])
+          and bg_broken.template_id == harness_name(BROKEN), covers=["Template.build_in_background"])
 
     path = "update" if Template.exists(FULL) else "create"
     logs, t0 = [], time.time()
     info = Template.build(full_template(), FULL, skip_cache=True, cpu_count=8, memory_mb=16384, min_free_disk_mb=1,
                           tags=["v1"], on_build_logs=logs.append)
-    check(f"build ({path}Harness) -> BuildInfo", info.alias == FULL and info.tags == ["v1"],
+    check(f"build ({path} {'Harness' if PV == 'V1' else 'V2 Runtime'}) -> BuildInfo", info.alias == FULL and info.tags == ["v1"],
           f"{time.time() - t0:.0f}s", covers=["Template.build"])
     check("build streams LogEntry lines", len(logs) > 20 and all(isinstance(x, e2b.LogEntry) for x in logs)
           and any("READY" in x.message for x in logs), f"{len(logs)} lines")
     env = {v["name"]: v["value"] for v in cfg.client("codebuild").batch_get_builds(ids=[info.build_id])["builds"][0]
            ["environment"]["environmentVariables"]}
     check("skip_cache -> docker build --no-cache", env.get("NO_CACHE") == "--no-cache")
+    rec = ac.template.load_template(cfg, FULL)
+    cp = cfg.client("bedrock-agentcore-control")
+    if PV == "V2":
+        rt = cp.get_agent_runtime(agentRuntimeId=rec["agent_runtime_id"])
+        check("V2: template deployed as a Runtime with platformVersion=V2",
+              rec["platform_version"] == "V2" and rt["platformVersion"] == "V2" and rt["status"] == "READY"
+              and rt["agentRuntimeArn"] == rec["agent_runtime_arn"], f"{rt['agentRuntimeName']} {rt['platformVersion']}")
+    else:
+        h = cp.get_harness(harnessId=rec["harness_id"])["harness"]
+        rt = cp.get_agent_runtime(agentRuntimeId=h["environment"]["agentCoreRuntimeEnvironment"]["agentRuntimeId"])
+        check("V1: template deployed as a Harness (backing runtime is V1)",
+              rec.get("platform_version", "V1") == "V1" and rt.get("platformVersion") == "V1", rt["agentRuntimeName"])
+    # The template built by the other platform's suite, if that suite has run in this account.
+    other = "full-py" if PV == "V2" else "full-py-v2"
+    if ac.template.load_template(cfg, other):
+        e = raises(e2b.TemplateException, lambda: Template.build(tiny, other))
+        check("rebuilding a template on the other platform is refused before any build",
+              isinstance(e, e2b.TemplateException) and "delete" in str(e), str(e)[:80])
     check("exists / alias_exists", Template.exists(FULL) and Template.alias_exists(FULL),
           covers=["Template.exists", "Template.alias_exists"])
 
@@ -291,9 +328,20 @@ def run():
         e = raises(e2b.TimeoutException, lambda: c.run("sleep 10", timeout=2))
         check("run: timeout -> TimeoutException", isinstance(e, e2b.TimeoutException))
         check("run: timeout=0 means no limit", c.run("sleep 2; echo ok", timeout=0).stdout == "ok\n")
+        got = []
+        r = c.run("sleep 1; echo long; exit 0", timeout=4000, on_stdout=got.append)
+        check("run: timeout above one V2 call (4000 s) still works, streams output",
+              r.stdout == "long\n" and "".join(got) == "long\n", f"platform {PV}")
+        e = raises(e2b.CommandExitException, lambda: c.run("exit 4", timeout=4000))
+        check("run: timeout above one V2 call keeps non-zero -> CommandExitException",
+              getattr(e, "exit_code", None) == 4)
         big = c.run("python3 -c \"print('a' * 70000)\"").stdout
-        check("run: one output line > 64 KB is dropped (documented AgentCore limit)", "a" * 70000 not in big,
-              f"got {len(big)} chars", covers=["Commands.run"])
+        if PV == "V1":
+            check("run: V1: one output line > 64 KB is dropped (documented AgentCore limit)", "a" * 70000 not in big,
+                  f"got {len(big)} chars", covers=["Commands.run"])
+        else:
+            check("run: V2: one output line > 64 KB arrives (no line limit on V2)", "a" * 70000 in big,
+                  f"got {len(big)} chars", covers=["Commands.run"])
         check("run: same output wrapped arrives whole",
               c.run("python3 -c \"print('a' * 70000)\" | fold -w 1000").stdout.replace("\n", "") == "a" * 70000)
 
@@ -312,6 +360,9 @@ def run():
         res = c.connect(h.pid).wait(on_stdout=got.append)
         check("disconnect, then commands.connect(pid).wait", res.stdout == "late\n" and "".join(got) == "late\n",
               covers=["CommandHandle.disconnect", "Commands.connect", "CommandHandle.wait"])
+        h = c.run("seq 1 20000", background=True)
+        check("background: 20000 lines arrive complete and in order",
+              h.wait().stdout.split() == [str(i) for i in range(1, 20001)], covers=["CommandHandle.wait"])
         h = c.run("exit 4", background=True)
         e = raises(e2b.CommandExitException, h.wait)
         check("handle.wait on non-zero -> CommandExitException", getattr(e, "exit_code", None) == 4)
@@ -340,6 +391,14 @@ def run():
         check("write bytes 200 KB at >= 30 KB/s (doc: ~100 KB/s)", 200 / dt >= 30, f"{200 / dt:.0f} KB/s",
               covers=["Filesystem.write"])
         check("read bytes -> bytearray", f.read("/work/blob.bin", format="bytes") == bytearray(blob))
+        # Large reads used to lose their tail now and then (AgentCore cuts off big outputs);
+        # read the same 1 MB file several times to make sure chunked, verified reads hold.
+        mb = os.urandom(1_000_000)
+        f.write("/work/mb.bin", mb)
+        check("read 1 MB x5, every byte intact", all(f.read("/work/mb.bin", format="bytes") == mb for _ in range(5)),
+              covers=["Filesystem.read"])
+        f.write("/work/empty", b"")
+        check("read empty file", f.read("/work/empty") == "")
         stream = list(f.read("/work/blob.bin", format="stream"))
         check("read stream -> one chunk", len(stream) == 1 and stream[0] == blob, covers=["Filesystem.read"])
         f.write("/work/io.txt", io.BytesIO(b"from io"), gzip=True, use_octet_stream=True)

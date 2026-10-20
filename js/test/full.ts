@@ -8,6 +8,10 @@
  *   node dist/test/full.js run       # sandboxes on full-js (~4 min)
  *   node dist/test/full.js all       # offline + build + run
  *
+ *   E2B_AGENTCORE_PLATFORM_VERSION=V2 node dist/test/full.js all
+ *                                    # same suite on platform V2 (plain Runtime with
+ *                                    # platformVersion=V2); templates get a -v2 suffix
+ *
  * How completeness is enforced: tools/coverage.ts generates the README's support table from
  * the installed e2b package. Every check() names the table rows it covers, and `all` fails if
  * any row is not covered. The checks test what the table SAYS:
@@ -33,15 +37,19 @@ import {
   CommandExitError, TimeoutError, FileNotFoundError, NotFoundError, SandboxNotFoundError, TemplateError,
   BuildError, AuthenticationError, LogEntry, waitForPort, renderDockerfile, harnessName,
 } from '../src/index.js'
-import { zipContext, mirrorImage } from '../src/template.js'
+import { zipContext, mirrorImage, loadTemplate, SERVER_FILE, SERVER_GO } from '../src/template.js'
+import { GetHarnessCommand, GetAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore-control'
+import fs from 'node:fs'
 import { coverageRows } from '../tools/coverage.js'
 
 // dist/test/full.js -> repo root (fixtures are shared with the Python tests)
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const FIX = path.join(ROOT, 'tests', 'fixtures', 'full')
-const FULL = 'full-js', BROKEN = 'full-js-broken'
+const PV = new Config().platformVersion // V1 (Harness) or V2 (plain Runtime), from the env
+const SFX = PV === 'V1' ? '' : '-v2' //   V1 and V2 suites use separate templates
+const FULL = 'full-js' + SFX, BROKEN = 'full-js-broken' + SFX
 // Unique per run: a deleted Harness stays DELETING for minutes and keeps its name taken.
-const DEL = `full-js-del-${Math.floor(Date.now() / 1000) % 100000}`
+const DEL = `full-js-del${SFX}-${Math.floor(Date.now() / 1000) % 100000}`
 const DSL_ROW = 'Template().fromImage / aptInstall / copy / runCmd / set* ...'
 const ROWS = new Map(coverageRows().map(([n, s, why]) => [n, { s, why }]))
 
@@ -108,6 +116,19 @@ async function offline() {
   check('render: start cmd not baked in', !df.includes('ENTRYPOINT') && df.trimEnd().endsWith('USER root'))
   check('render: includeStartCmd -> ENTRYPOINT',
     renderDockerfile(fullTemplate(), true).trimEnd().endsWith('ENTRYPOINT python3 -m http.server 8000'))
+  const v2df = renderDockerfile(fullTemplate(), false, '', true)
+  check('render V2: Go builder stage first, user image last',
+    v2df.startsWith('FROM golang:1.24-alpine AS e2b_agentcore_server\n') && v2df.split('\nFROM ').length === 2
+    && v2df.includes('CGO_ENABLED=0'))
+  check('render V2: static server is the ENTRYPOINT, start cmd not baked in', v2df.trimEnd().endsWith(
+    'COPY --from=e2b_agentcore_server /server /opt/e2b-agentcore/server\nENTRYPOINT ["/opt/e2b-agentcore/server"]\nCMD []'))
+  const v2zip = unzipSync(zipContext(fullTemplate(), v2df, { [SERVER_FILE]: SERVER_GO }))
+  check('zip V2: server source shipped in the build context',
+    new TextDecoder().decode(v2zip[SERVER_FILE]).includes('0.0.0.0:8080'))
+  const pyGo = /SERVER_GO = """([\s\S]*?)"""/.exec(fs.readFileSync(path.join(ROOT, 'e2b_agentcore', 'template.py'), 'utf8'))?.[1]
+  check('V2 server source identical to the Python package', pyGo === SERVER_GO)
+  check('Config platformVersion accepts only V1 / V2', (await raises(() => new Config({ platformVersion: 'V3' }))) instanceof Error
+    && new Config({ platformVersion: 'v2' }).platformVersion === 'V2')
   const names = Object.keys(unzipSync(zipContext(fullTemplate(), df))).sort()
   check('zip: COPY sources only; .dockerignore and fileIgnorePatterns applied',
     names.join() === 'Dockerfile.e2b,app/keep.txt,app/sub/nested.txt,run.sh', names.join())
@@ -188,7 +209,7 @@ async function build() {
   const bgBroken = await Template.buildInBackground(broken, BROKEN)
   const tiny = Template().fromUbuntuImage('24.04')
   const bgDel = await Template.buildInBackground(tiny, DEL)
-  check('buildInBackground -> BuildInfo', bgBroken.templateId === 'e2b_full_js_broken' && bgBroken.alias === BROKEN, '',
+  check('buildInBackground -> BuildInfo', bgBroken.templateId === harnessName(BROKEN) && bgBroken.alias === BROKEN, '',
     ['static Template.buildInBackground'])
 
   const how = (await Template.exists(FULL)) ? 'update' : 'create'
@@ -197,7 +218,7 @@ async function build() {
   const info = await Template.build(fullTemplate(), FULL, {
     skipCache: true, cpuCount: 8, memoryMB: 16384, minFreeDiskMb: 1, tags: ['v1'], onBuildLogs: (e: LogEntry) => { logs.push(e) },
   })
-  check(`build (${how}Harness) -> BuildInfo`, info.alias === FULL && info.tags.join() === 'v1',
+  check(`build (${how} ${PV === 'V1' ? 'Harness' : 'V2 Runtime'}) -> BuildInfo`, info.alias === FULL && info.tags.join() === 'v1',
     `${Math.round((Date.now() - t0) / 1000)}s`, ['static Template.build'])
   check('build streams LogEntry lines (start/end markers included)', logs.length > 20
     && logs[0] instanceof e2b.LogEntryStart && logs.at(-1) instanceof e2b.LogEntryEnd
@@ -205,6 +226,26 @@ async function build() {
   const b = (await cfg.codebuild.send(new BatchGetBuildsCommand({ ids: [info.buildId] }))).builds![0]
   const env = Object.fromEntries((b.environment?.environmentVariables ?? []).map((v) => [v.name, v.value]))
   check('skipCache -> docker build --no-cache', env.NO_CACHE === '--no-cache')
+  const rec = (await loadTemplate(cfg, FULL))!
+  if (PV === 'V2') {
+    const rt = await cfg.control.send(new GetAgentRuntimeCommand({ agentRuntimeId: rec.agent_runtime_id }))
+    check('V2: template deployed as a Runtime with platformVersion=V2', rec.platform_version === 'V2'
+      && (rt as any).platformVersion === 'V2' && rt.status === 'READY' && rt.agentRuntimeArn === rec.agent_runtime_arn,
+      `${rt.agentRuntimeName} ${(rt as any).platformVersion}`)
+  } else {
+    const h = (await cfg.control.send(new GetHarnessCommand({ harnessId: rec.harness_id }))).harness as any
+    const rt = await cfg.control.send(new GetAgentRuntimeCommand({
+      agentRuntimeId: h.environment.agentCoreRuntimeEnvironment.agentRuntimeId }))
+    check('V1: template deployed as a Harness (backing runtime is V1)',
+      (rec.platform_version ?? 'V1') === 'V1' && (rt as any).platformVersion === 'V1', rt.agentRuntimeName)
+  }
+  // The template built by the other platform's suite, if that suite has run in this account.
+  const other = PV === 'V2' ? 'full-js' : 'full-js-v2'
+  if (await loadTemplate(cfg, other)) {
+    const oe = await raises(() => Template.build(tiny, other))
+    check('rebuilding a template on the other platform is refused before any build',
+      oe instanceof TemplateError && String((oe as Error).message).includes('delete'), String((oe as Error)?.message).slice(0, 80))
+  }
   check('exists / aliasExists', (await Template.exists(FULL)) && (await Template.aliasExists(FULL)), '',
     ['static Template.exists', 'static Template.aliasExists'])
 
@@ -275,9 +316,17 @@ async function run() {
     check('run: non-zero -> CommandExitError', e instanceof CommandExitError && e.exitCode === 3 && e.stderr.includes('oops'))
     check('run: timeout -> TimeoutError', (await raises(() => c.run('sleep 10', { timeoutMs: 2000 }))) instanceof TimeoutError)
     check('run: timeoutMs 0 means no limit', (await c.run('sleep 2; echo ok', { timeoutMs: 0 })).stdout === 'ok\n')
+    const longOut: string[] = []
+    const lr = await c.run('sleep 1; echo long; exit 0', { timeoutMs: 4_000_000, onStdout: (d) => { longOut.push(d) } })
+    check('run: timeout above one V2 call (4000 s) still works, streams output',
+      lr.stdout === 'long\n' && longOut.join('') === 'long\n', `platform ${PV}`)
+    const le = await raises(() => c.run('exit 4', { timeoutMs: 4_000_000 }))
+    check('run: timeout above one V2 call keeps non-zero -> CommandExitError', (le as any)?.exitCode === 4)
     const big = (await c.run("python3 -c \"print('a' * 70000)\"")).stdout
-    check('run: one output line > 64 KB is dropped (documented AgentCore limit)', !big.includes('a'.repeat(70000)),
-      `got ${big.length} chars`, ['Commands.run'])
+    if (PV === 'V1') check('run: V1: one output line > 64 KB is dropped (documented AgentCore limit)',
+      !big.includes('a'.repeat(70000)), `got ${big.length} chars`, ['Commands.run'])
+    else check('run: V2: one output line > 64 KB arrives (no line limit on V2)',
+      big.includes('a'.repeat(70000)), `got ${big.length} chars`, ['Commands.run'])
     check('run: same output wrapped arrives whole',
       (await c.run("python3 -c \"print('a' * 70000)\" | fold -w 1000")).stdout.replace(/\n/g, '') === 'a'.repeat(70000))
 
@@ -302,6 +351,10 @@ async function run() {
     const res2 = await (await c.connect(hd.pid, { onStdout: (d) => { got2.push(d) } })).wait()
     check('commands.connect(pid) after disconnect', res2.stdout === 'late\n' && got2.join('') === 'late\n', '',
       ['Commands.connect', 'CommandHandle.disconnect'])
+    const hSeq = await c.run('seq 1 20000', { background: true })
+    check('background: 20000 lines arrive complete and in order',
+      (await hSeq.wait()).stdout.split('\n').slice(0, -1).join() === Array.from({ length: 20000 }, (_, i) => String(i + 1)).join(),
+      '', ['CommandHandle.wait'])
     const h4 = await c.run('exit 4', { background: true })
     e = await raises(() => h4.wait())
     check('handle.wait on non-zero -> CommandExitError', e instanceof CommandExitError && e.exitCode === 4
@@ -328,6 +381,15 @@ async function run() {
     const kbs = 200 / ((Date.now() - tw) / 1000)
     check('write 200 KB at >= 30 KB/s (doc: ~100 KB/s)', kbs >= 30, `${kbs.toFixed(0)} KB/s`, ['Filesystem.write'])
     check('read bytes -> Uint8Array', Buffer.from(await f.read('/work/blob.bin', { format: 'bytes' })).equals(blob))
+    // Large reads used to lose their tail now and then (AgentCore cuts off big outputs); read
+    // the same 1 MB file several times to make sure chunked, verified reads hold.
+    const mb = randomBytes(1_000_000)
+    await f.write('/work/mb.bin', mb)
+    let mbOk = true
+    for (let i = 0; i < 5; i++) mbOk &&= Buffer.from(await f.read('/work/mb.bin', { format: 'bytes' })).equals(mb)
+    check('read 1 MB x5, every byte intact', mbOk, '', ['Filesystem.read'])
+    await f.write('/work/empty', new Uint8Array())
+    check('read empty file', (await f.read('/work/empty')) === '')
     check('read blob', Buffer.from(await (await f.read('/work/blob.bin', { format: 'blob' })).arrayBuffer()).equals(blob))
     const reader = (await f.read('/work/blob.bin', { format: 'stream' })).getReader()
     const parts: Uint8Array[] = []

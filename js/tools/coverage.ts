@@ -24,10 +24,12 @@ const PARTIAL: Record<string, string> = {
   'Sandbox.isRunning': 'probes the microVM (~0.4 s), not a control-plane lookup',
   'Sandbox.git': 'official e2b Git helper over our commands (E2B marks it deprecated)',
   'Commands.run': 'user defaults to root; stdin unsupported; background output arrives in ~1 s chunks; ' +
-    'AgentCore drops any single output line over ~64 KB',
+    'V1 drops any single output line over ~64 KB; big outputs (~20k+ lines) can lose their ' +
+    'tail (V1 and V2), and on V2 lines of a large output can arrive out of order; on V2 a ' +
+    'foreground command with timeout over ~1 h (or 0) runs as background, output in ~1 s chunks',
   'Commands.list': 'background commands started through this SDK only (as E2B: envd-started only)',
   'Filesystem.write': 'base64 over commands, ~100 KB/s; gzip/useOctetStream ignored',
-  'Filesystem.read': "whole file in one call; format 'stream' yields one chunk",
+  'Filesystem.read': "read in verified 192 KB chunks (one call each); format 'stream' yields one chunk",
   'static Template.build': 'cpuCount/memoryMB/minFreeDiskMb ignored; tags unsupported',
   'static Template.buildInBackground': 'same as build',
 }

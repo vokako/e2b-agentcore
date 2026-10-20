@@ -39,7 +39,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Union
 
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from e2b import (CommandExitException, CommandResult, EntryInfo, FileNotFoundException, FileType,
+from e2b import (SandboxException, CommandExitException, CommandResult, EntryInfo, FileNotFoundException, FileType,
                  InvalidArgumentException, NotFoundException, ProcessInfo, SandboxInfo, SandboxMetrics,
                  SandboxNotFoundException, SandboxQuery, SandboxState, TimeoutException, WriteInfo)
 from e2b import Git as _E2BGit
@@ -48,6 +48,13 @@ from ._config import Config
 from ._errors import NotSupportedException, aws_errors, not_supported
 from .template import load_template
 
+# V2 runtimes reject an InvokeAgentRuntimeCommand timeout above 3600 s (V1 accepts any).
+# _exec sends `limit + 30`, and `timeout -k 5` adds 5 s more, so one call can wait 3565 s.
+V2_MAX_CALL_S = 3565
+END_MARK = "@E2B-AGENTCORE-END"   # last line of SDK-internal replies: "<mark>:<line count>"
+B64_LINE = 3000                   # base64 line width for reads (V1 drops lines over ~64 KB)
+READ_CHUNK = 192 * 1024           # files.read fetches this many bytes per command
+READ_RETRIES = 5
 MAX_CMD = 65536                  # InvokeAgentRuntimeCommand limit on the command string
 STATE = "/tmp/.e2b"              # in-VM state dir (see module docstring)
 ENOENT = 44                      # exit code our scripts use for "path does not exist"
@@ -105,20 +112,21 @@ class CommandHandle:
         return self._pid
 
     def _poll_once(self):
-        # Sections are separated by marker lines; base64 is wrapped because AgentCore drops
-        # output lines longer than ~64 KB.
+        # Sections are separated by marker lines; base64 is wrapped because V1 drops output
+        # lines longer than ~64 KB. Sent through _exec_ordered: the reply is verified, and a
+        # lost or reordered reply just means "poll again" (offsets only move on success).
         d = f"{STATE}/p/{self._tag}"
-        r = self._s._exec(
+        text = self._s._exec_ordered(
             f"echo @OUT; tail -c +{self._out_off + 1} {d}.out 2>/dev/null | base64\n"
             f"echo @ERR; tail -c +{self._err_off + 1} {d}.err 2>/dev/null | base64\n"
             f"echo @STATE; if [ -f {d}.rc ]; then cat {d}.rc; elif kill -0 {self._pid} 2>/dev/null; then echo run; "
-            f"else echo gone; fi\n", 60, raw=True)
+            f"else echo gone; fi", 60)
         try:
-            _, rest = r.stdout.split("@OUT\n", 1)
+            _, rest = text.split("@OUT\n", 1)
             out_b64, rest = rest.split("@ERR\n", 1)
             err_b64, state = rest.split("@STATE\n", 1)
-        except ValueError:
-            return "", "", "run"   # transient: malformed reply, poll again
+        except (AttributeError, ValueError):
+            return "", "", "run"   # reply lost or malformed: poll again
         out = base64.b64decode(out_b64).decode(errors="replace")
         err = base64.b64decode(err_b64).decode(errors="replace")
         self._out_off += len(base64.b64decode(out_b64))
@@ -191,22 +199,22 @@ class Commands:
         if user and user != "root":
             body = f"exec runuser -u {shlex.quote(user)} -- bash -c {shlex.quote(body)}\n"
 
-        if background:
-            tag = uuid.uuid4().hex[:12]
-            d = f"{STATE}/p/{tag}"
-            spawn = (f"mkdir -p {STATE}/p\n"
-                     f"echo {base64.b64encode(body.encode()).decode()} | base64 -d > {d}.sh\n"
-                     f"echo {shlex.quote(cmd)} > {d}.cmd\n"
-                     # setsid: own process group, so kill() can take children down too.
-                     f"setsid nohup bash -c '[ -f {STATE}/env ] && . {STATE}/env; bash {d}.sh; echo $? > {d}.rc' "
-                     f"> {d}.out 2> {d}.err < /dev/null &\n"
-                     f"echo $! | tee {d}.pid\n")
-            r = self._s._exec(spawn, 60, raw=True)
-            if r.exit_code != 0:
-                raise CommandExitException(stderr=r.stderr, stdout=r.stdout, exit_code=r.exit_code, error="spawn failed")
-            return CommandHandle(self._s, int(r.stdout.strip().splitlines()[-1]), tag)
-
         limit = timeout if timeout else self._s._cfg.max_lifetime_s
+        if not background and self._s._v2 and limit > V2_MAX_CALL_S:
+            # Too long for one V2 call: run it as a background command and follow its output,
+            # so timeout (and timeout=0 = no limit) behave exactly as on V1.
+            wrapped = f"timeout -k 5 {int(timeout)} bash -c {shlex.quote(body)}\n" if timeout else body
+            start = time.time()
+            try:
+                return self._spawn(wrapped, cmd).wait(on_stdout=on_stdout, on_stderr=on_stderr)
+            except CommandExitException as exc:
+                if exc.exit_code in (124, 137) and timeout and time.time() - start >= timeout - 1:
+                    raise TimeoutException(f"command timed out after {timeout}s: {cmd[:200]}") from None
+                raise
+
+        if background:
+            return self._spawn(body, cmd)
+
         start = time.time()
         res = self._s._exec(body, limit, on_stdout, on_stderr)
         if res.exit_code in (124, 137) and timeout and time.time() - start >= timeout - 1:
@@ -215,6 +223,22 @@ class Commands:
             raise CommandExitException(stderr=res.stderr, stdout=res.stdout, exit_code=res.exit_code,
                                        error=res.error)
         return res
+
+    def _spawn(self, body: str, cmd: str) -> CommandHandle:
+        """Start `body` detached in the microVM; output and exit code go to files we poll."""
+        tag = uuid.uuid4().hex[:12]
+        d = f"{STATE}/p/{tag}"
+        spawn = (f"mkdir -p {STATE}/p\n"
+                 f"echo {base64.b64encode(body.encode()).decode()} | base64 -d > {d}.sh\n"
+                 f"echo {shlex.quote(cmd)} > {d}.cmd\n"
+                 # setsid: own process group, so kill() can take children down too.
+                 f"setsid nohup bash -c '[ -f {STATE}/env ] && . {STATE}/env; bash {d}.sh; echo $? > {d}.rc' "
+                 f"> {d}.out 2> {d}.err < /dev/null &\n"
+                 f"echo $! | tee {d}.pid\n")
+        r = self._s._exec(spawn, 60, raw=True)
+        if r.exit_code != 0:
+            raise CommandExitException(stderr=r.stderr, stdout=r.stdout, exit_code=r.exit_code, error="spawn failed")
+        return CommandHandle(self._s, int(r.stdout.strip().splitlines()[-1]), tag)
 
     def list(self, request_timeout: Optional[float] = None) -> List[ProcessInfo]:
         """Running background commands started through this SDK (like E2B: only envd-started ones)."""
@@ -277,14 +301,26 @@ class Files:
              stream_idle_timeout: Optional[float] = None):
         """format="text" -> str, "bytes" -> bytearray, "stream" -> iterator of bytes (as E2B)."""
         q = shlex.quote(path)
-        # Wrapped base64 (76-char lines), not -w0: AgentCore's output stream silently drops
-        # any single line longer than ~64 KB. b64decode ignores the newlines.
-        raw = base64.b64decode(self._run(self._must_exist(q) + self._as_user(f"base64 {q}", user), path).stdout)
+        size = int(self._run(self._must_exist(q) + self._as_user(f"stat -L -c %s {q}", user), path).stdout.split()[-1])
+        raw = bytearray()
+        while len(raw) < size:
+            raw += self._read_chunk(q, len(raw), min(READ_CHUNK, size - len(raw)), user, path)
         if format == "bytes":
             return bytearray(raw)
         if format == "stream":
             return iter([raw])
         return raw.decode()
+
+    def _read_chunk(self, q: str, off: int, n: int, user: Optional[str], path: str) -> bytes:
+        """`n` bytes at `off`, verified (see Sandbox._exec_ordered); refetched if incomplete."""
+        script = self._as_user(f"tail -c +{off + 1} {q} | head -c {n} | base64 -w {B64_LINE}", user)
+        for _ in range(READ_RETRIES):
+            text = self._s._exec_ordered(script, 120)
+            if text is not None:
+                data = base64.b64decode(text)
+                if len(data) == n:
+                    return data
+        raise SandboxException(f"files.read({path!r}): output kept arriving incomplete at offset {off}")
 
     def write(self, path: str, data: Union[str, bytes, "IO"], user: Optional[str] = None,
               request_timeout: Optional[float] = None, gzip: bool = False,
@@ -375,8 +411,11 @@ class Sandbox:
 
     def __init__(self, cfg: Config, record: dict):
         self._cfg, self._rec = cfg, record
-        self._arn = record["harness_arn"]
+        # The ARN every command is sent to: a Harness ARN (V1) or a Runtime ARN (V2).
+        # Older records only have "harness_arn".
+        self._arn = record.get("agent_runtime_arn") or record["harness_arn"]
         self._workdir = record.get("workdir")
+        self._v2 = record.get("platform_version") == "V2"
         # read_timeout must outlast the longest command: botocore's default is 60 s, and a
         # command that prints nothing for longer would otherwise fail with ReadTimeoutError.
         self._data = cfg.session.client("bedrock-agentcore", config=BotoConfig(
@@ -441,7 +480,9 @@ class Sandbox:
 
         started = time.time()
         rec = {"sandbox_id": "sbx" + uuid.uuid4().hex,          # 35 chars; runtimeSessionId needs >= 33
-               "template": alias, "harness_arn": tpl["harness_arn"], "workdir": tpl.get("workdir"),
+               "template": alias, "agent_runtime_arn": tpl.get("agent_runtime_arn") or tpl["harness_arn"],
+               "harness_arn": tpl.get("agent_runtime_arn") or tpl["harness_arn"],   # read by older SDKs
+               "platform_version": tpl.get("platform_version", "V1"), "workdir": tpl.get("workdir"),
                "metadata": metadata or {}, "started_at": started, "end_at": started + cfg.max_lifetime_s}
         sbx = cls(cfg, rec)
 
@@ -583,6 +624,32 @@ class Sandbox:
 
     # --------------------------------------------------------------- transport
 
+    def _exec_ordered(self, script: str, timeout: float) -> Optional[str]:
+        """Run an SDK-internal, read-only `script` and return its stdout verified, or None.
+
+        AgentCore streams stdout one line per event, and big outputs are not delivered
+        reliably: on V1 and V2 the last lines can be lost when the command exits right after
+        printing, and on V2 lines can also arrive out of order. So every line is numbered in
+        the microVM (awk) and followed by an end line carrying the count; here the lines are
+        put back in order and the reply is accepted only if every line 1..count is present.
+        Callers retry on None. User commands (commands.run) cannot be fixed this way, since
+        their output is the user's own.
+        """
+        r = self._exec(f"{{ {script}\n}} | awk '{{print NR\":\"$0}} END{{print \"{END_MARK}:\"NR}}'",
+                       timeout, raw=True)
+        lines, total = {}, None
+        for line in r.stdout.split("\n"):
+            head, sep, body = line.partition(":")
+            if not sep:
+                continue
+            if head == END_MARK and body.isdigit():
+                total = int(body)
+            elif head.isdigit():
+                lines[int(head)] = body
+        if total is None or len(lines) != total or any(k not in lines for k in range(1, total + 1)):
+            return None
+        return "".join(lines[k] + "\n" for k in range(1, total + 1))
+
     def _exec(self, script: str, timeout: float, on_stdout=None, on_stderr=None, raw: bool = False) -> CommandResult:
         """Run `script` with bash in the microVM; one InvokeAgentRuntimeCommand call.
 
@@ -593,6 +660,8 @@ class Sandbox:
         pre = "" if raw else f"[ -f {STATE}/env ] && . {STATE}/env\n"
         b64 = base64.b64encode((pre + script).encode()).decode()
         t = max(1, int(timeout))
+        if self._v2:   # one V2 call can't wait longer; Commands.run goes background past this
+            t = min(t, V2_MAX_CALL_S)
         cmd = (f"/bin/sh -c 'f=$(mktemp); echo {b64} | base64 -d > $f; "
                f"timeout -k 5 {t} bash $f; rc=$?; rm -f $f; exit $rc'")
         if len(cmd) > MAX_CMD:

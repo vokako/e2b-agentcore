@@ -68,11 +68,54 @@ check. Each check tests what its row says: `yes` works as in E2B, `partial` show
 written in the Notes column, `no` raises `NotSupportedException`. Stages: `offline` (no resources
 created), `build` (templates `full-py`, a deliberately broken one, and one that is deleted again),
 `run` (sandboxes). With `js/dist` built it also checks that Python and JS share templates and
-sandboxes. Last run (2026-10-16, us-east-2): 130 passed, 0 failed, 61/61 rows covered.
+sandboxes. Results for both platforms are under "Platform V1 or V2".
 
 Env vars: `E2B_AGENTCORE_REGION` (default us-east-2), `E2B_AGENTCORE_EXEC_ROLE_ARN` (required for builds),
 `E2B_AGENTCORE_MODEL_ID` (the Harness API requires one; never called), `E2B_AGENTCORE_PREFIX`
-(default `e2b-agentcore`), `E2B_AGENTCORE_IDLE_TIMEOUT` / `E2B_AGENTCORE_MAX_LIFETIME` (900 / 28800 s, per Harness).
+(default `e2b-agentcore`), `E2B_AGENTCORE_IDLE_TIMEOUT` / `E2B_AGENTCORE_MAX_LIFETIME` (900 / 28800 s, per Harness),
+`E2B_AGENTCORE_PLATFORM_VERSION` (`V1` default, or `V2`; see below).
+
+## Platform V1 or V2
+
+AgentCore Runtime has two platform versions. V2 restores every session from a MicroVM snapshot
+taken at deploy time. Pick one per build:
+
+```python
+Template.build(t, "my-sandbox", config=Config(platform_version="V2"))
+# or: export E2B_AGENTCORE_PLATFORM_VERSION=V2
+```
+
+`Sandbox` code doesn't change: `Sandbox.create("my-sandbox")` reads the platform from the template.
+
+| | V1 (default) | V2 |
+|---|---|---|
+| Deployed as | Harness `e2b_<alias>` (its backing runtime is V1) | Runtime `e2b_<alias>` with `platformVersion=V2` |
+| Image changes | none | the build adds a static Go server (`/opt/e2b-agentcore/server`, ENTRYPOINT) answering `/ping` and `/invocations` on :8080, and reaping orphan processes as PID 1 |
+| Rebuild to READY (`full-py`, measured 2026-10-20) | 88-101 s | 331-333 s (V2 takes the snapshot at deploy) |
+| First command in a new session (cold start) | 7.6-8.7 s | 1.7-2.4 s |
+| `Sandbox.create` incl. start command + ready check | 11.2 s | 4.7 s (21-23 s for the first sandbox right after a deploy) |
+| Later commands | ~0.33 s | ~0.27 s |
+| One command call | no timeout cap | timeout capped at 3600 s; longer foreground commands run as background commands transparently |
+| Command output | lines over ~64 KB dropped | no line limit; lines of a large output can arrive out of order (`seq 1 1000`: 1 of 8 runs, `seq 1 20000`: 5 of 8) |
+
+Why V2 is not a Harness: `CreateHarness` / `UpdateHarness` have no platform field, and a Harness's
+backing runtime is always V1. A plain Runtime needs an HTTP server in the image, hence the added
+server stage. A template keeps the platform it was first built with; to switch, `Template.delete`
+it and build again (the SDK refuses a cross-platform rebuild before starting CodeBuild).
+
+On both platforms AgentCore can also lose the last lines of a very large output (seen with
+`seq 1 20000`). The SDK's own reads (`files.read`, background-command output) are immune: each
+line is numbered inside the microVM, reordered and counted on arrival, and refetched if incomplete.
+Output of your own `commands.run` can't be verified that way; for large output, write it to a
+file and `files.read` it.
+
+Both suites run on V2 with `E2B_AGENTCORE_PLATFORM_VERSION=V2` (templates get a `-v2` suffix).
+Last runs (2026-10-20, us-east-2), all with 0 failures and every table row covered:
+
+| Suite | V1 | V2 |
+|---|---|---|
+| Python `tests/test_full.py all` | 141 passed | 141 passed |
+| JS `npm run test:full -- all` | 151 passed | 151 passed |
 
 ## What `Template.build` does
 
@@ -83,7 +126,8 @@ Env vars: `E2B_AGENTCORE_REGION` (default us-east-2), `E2B_AGENTCORE_EXEC_ROLE_A
 3. Zip the Dockerfile plus only the files that `COPY` steps reference (`.dockerignore` honoured).
 4. Upload to S3 (`contexts/`, expires after 7 days).
 5. CodeBuild: native arm64 `docker build`, push `<registry>/<prefix>/templates:<alias>-<timestamp>`.
-6. Create or update Harness `e2b_<alias>` with that image; wait until it is READY on the new image.
+6. V1: create or update Harness `e2b_<alias>` with that image. V2: create or update Runtime
+   `e2b_<alias>` with `platformVersion=V2`. Wait until it is READY on the new image.
 7. Write `templates/<alias>.json` (start/ready command, workdir) for `Sandbox.create`.
 
 Each step is commented in `e2b_agentcore/template.py`; the buildspec and the one-time infra are in
@@ -111,9 +155,10 @@ redeployed to Runtime `sbx_ubuntu24` and answering.
 | One command | about 0.3-0.4 s |
 | `files.write` 200 KB | 3.1 s |
 
-Found while testing: AgentCore's command output stream silently drops any single line longer than
-about 64 KB (wrapped output arrives intact). File reads use wrapped base64 for this reason; user
-commands that print one huge line will lose it.
+Found while testing: on V1, AgentCore's command output stream silently drops any single line longer
+than about 64 KB (wrapped output arrives intact). File reads use wrapped base64 for this reason; user
+commands that print one huge line will lose it. V2 has no such limit, but see "Platform V1 or V2"
+for its ordering issue.
 
 Not provided: `AsyncSandbox` / `AsyncTemplate`, `pty`, and the code-interpreter SDK's `run_code`
 (AgentCore Code Interpreter is the native match for that; see the mapping below).
@@ -161,7 +206,7 @@ Checked against e2b 2.56.0
 | `Commands.connect` | yes |  |
 | `Commands.kill` | yes |  |
 | `Commands.list` | partial | background commands started through this SDK only (as E2B: envd-started only) |
-| `Commands.run` | partial | user defaults to root; stdin=True unsupported; background output arrives in ~1 s chunks; AgentCore drops any single output line over ~64 KB |
+| `Commands.run` | partial | user defaults to root; stdin=True unsupported; background output arrives in ~1 s chunks; V1 drops any single output line over ~64 KB; big outputs (~20k+ lines) can lose their tail (V1 and V2), and on V2 lines of a large output can arrive out of order; on V2 a foreground command with timeout over ~1 h (or 0) runs as background, output in ~1 s chunks |
 | `Commands.send_stdin` | no | InvokeAgentRuntimeCommand has no stdin channel |
 | `CommandHandle.close_stdin` | no | InvokeAgentRuntimeCommand has no stdin channel |
 | `CommandHandle.disconnect` | yes |  |
@@ -173,7 +218,7 @@ Checked against e2b 2.56.0
 | `Filesystem.get_info` | yes |  |
 | `Filesystem.list` | yes |  |
 | `Filesystem.make_dir` | yes |  |
-| `Filesystem.read` | partial | whole file in one call; format='stream' yields one chunk |
+| `Filesystem.read` | partial | read in verified 192 KB chunks (one call each); format='stream' yields one chunk |
 | `Filesystem.remove` | yes |  |
 | `Filesystem.rename` | yes |  |
 | `Filesystem.watch_dir` | no | no file-event stream from the microVM; poll files.list instead |

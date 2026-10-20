@@ -45,6 +45,13 @@ import { Config, awsCode, sleep } from './config.js'
 import { awsErrors, notSupported, NotSupportedError } from './errors.js'
 import { loadTemplate, type AgentCoreOpts } from './template.js'
 
+// V2 runtimes reject an InvokeAgentRuntimeCommand timeout above 3600 s (V1 accepts any).
+// _exec sends `limit + 30`, and `timeout -k 5` adds 5 s more, so one call can wait 3565 s.
+export const V2_MAX_CALL_S = 3565
+const END_MARK = '@E2B-AGENTCORE-END' // last line of SDK-internal replies: "<mark>:<line count>"
+const B64_LINE = 3000 //                 base64 line width for reads (V1 drops lines over ~64 KB)
+const READ_CHUNK = 192 * 1024 //         files.read fetches this many bytes per command
+const READ_RETRIES = 5
 const MAX_CMD = 65536 //        InvokeAgentRuntimeCommand limit on the command string
 const STATE = '/tmp/.e2b' //    in-VM state dir (see module docstring)
 const ENOENT = 44 //            exit code our scripts use for "path does not exist"
@@ -71,7 +78,11 @@ function result(stdout: string, stderr: string, exitCode: number, error?: string
 export interface SandboxRecord {
   sandbox_id: string
   template: string
+  /** The ARN commands go to: Harness ARN (V1) or Runtime ARN (V2). Older records lack it. */
+  agent_runtime_arn?: string
+  /** Same value as agent_runtime_arn; the only field in records from before V2 support. */
   harness_arn: string
+  platform_version?: 'V1' | 'V2'
   workdir?: string | null
   metadata: Record<string, string>
   started_at: number
@@ -137,16 +148,17 @@ export class CommandHandle {
   get error() { return this.res?.error }
 
   private async pollOnce(): Promise<[string, string, string]> {
-    // Sections are separated by marker lines; base64 is wrapped (76-char lines) because
-    // AgentCore drops output lines longer than ~64 KB.
+    // Sections are separated by marker lines; base64 is wrapped because V1 drops output lines
+    // longer than ~64 KB. Sent through _execOrdered: the reply is verified, and a lost or
+    // reordered reply just means "poll again" (offsets only move on success).
     const d = `${STATE}/p/${this.tag}`
-    const r = await this.sbx._exec(
+    const text = await this.sbx._execOrdered(
       `echo @OUT; tail -c +${this.outOff + 1} ${d}.out 2>/dev/null | base64\n` +
       `echo @ERR; tail -c +${this.errOff + 1} ${d}.err 2>/dev/null | base64\n` +
       `echo @STATE; if [ -f ${d}.rc ]; then cat ${d}.rc; elif kill -0 ${this.pid} 2>/dev/null; then echo run; ` +
-      `else echo gone; fi\n`, 60, { raw: true })
-    const m = r.stdout.match(/^@OUT\n([\s\S]*?)@ERR\n([\s\S]*?)@STATE\n([\s\S]*)$/)
-    if (!m) return ['', '', 'run'] // transient: malformed reply, poll again
+      `else echo gone; fi`, 60)
+    const m = text?.match(/^@OUT\n([\s\S]*?)@ERR\n([\s\S]*?)@STATE\n([\s\S]*)$/)
+    if (!m) return ['', '', 'run'] // reply lost or malformed: poll again
     const out = Buffer.from(m[1], 'base64'), err = Buffer.from(m[2], 'base64')
     this.outOff += out.length
     this.errOff += err.length
@@ -217,7 +229,36 @@ export class Commands {
     body += cmd + '\n'
     if (opts.user && opts.user !== 'root') body = `exec runuser -u ${q(opts.user)} -- bash -c ${q(body)}\n`
 
-    if (opts.background) {
+    const timeoutS = opts.timeoutMs === undefined ? 60 : opts.timeoutMs / 1000
+    const limit = timeoutS || this.sbx._cfg.maxLifetimeS
+    if (!opts.background && this.sbx._v2 && limit > V2_MAX_CALL_S) {
+      // Too long for one V2 call: run it as a background command and follow its output, so
+      // timeoutMs (and 0 = no limit) behave exactly as on V1.
+      const wrapped = timeoutS ? `timeout -k 5 ${Math.trunc(timeoutS)} bash -c ${q(body)}\n` : body
+      const start = Date.now()
+      try {
+        return await (await this.spawn(wrapped, cmd, opts)).wait()
+      } catch (e) {
+        if (e instanceof CommandExitError && [124, 137].includes(e.exitCode) && timeoutS
+          && (Date.now() - start) / 1000 >= timeoutS - 1)
+          throw new TimeoutError(`command timed out after ${timeoutS}s: ${cmd.slice(0, 200)}`)
+        throw e
+      }
+    }
+
+    if (opts.background) return this.spawn(body, cmd, opts)
+
+    const start = Date.now()
+    const res = await this.sbx._exec(body, limit, { onStdout: opts.onStdout, onStderr: opts.onStderr })
+    if ([124, 137].includes(res.exitCode) && timeoutS && (Date.now() - start) / 1000 >= timeoutS - 1)
+      throw new TimeoutError(`command timed out after ${timeoutS}s: ${cmd.slice(0, 200)}`)
+    if (res.exitCode !== 0) throw new CommandExitError(res)
+    return res
+  }
+
+  /** Start `body` detached in the microVM; output and exit code go to files we poll. */
+  private async spawn(body: string, cmd: string, opts: CommandStartOpts): Promise<CommandHandle> {
+    {
       const tag = randomUUID().replace(/-/g, '').slice(0, 12)
       const d = `${STATE}/p/${tag}`
       const spawn =
@@ -233,15 +274,6 @@ export class Commands {
       const pid = Number(r.stdout.trim().split('\n').at(-1))
       return new CommandHandle(this.sbx, pid, tag, opts.onStdout, opts.onStderr)
     }
-
-    const timeoutS = opts.timeoutMs === undefined ? 60 : opts.timeoutMs / 1000
-    const limit = timeoutS || this.sbx._cfg.maxLifetimeS
-    const start = Date.now()
-    const res = await this.sbx._exec(body, limit, { onStdout: opts.onStdout, onStderr: opts.onStderr })
-    if ([124, 137].includes(res.exitCode) && timeoutS && (Date.now() - start) / 1000 >= timeoutS - 1)
-      throw new TimeoutError(`command timed out after ${timeoutS}s: ${cmd.slice(0, 200)}`)
-    if (res.exitCode !== 0) throw new CommandExitError(res)
-    return res
   }
 
   /** Running background commands started through this SDK (like E2B: only envd-started ones). */
@@ -321,16 +353,30 @@ export class Filesystem {
   read(path: string, opts: FileOpts & { format: 'stream' }): Promise<ReadableStream<Uint8Array>>
   async read(path: string, opts: FileOpts & { format?: 'text' | 'bytes' | 'blob' | 'stream' } = {}): Promise<unknown> {
     const p = q(path)
-    // Wrapped base64 (76-char lines), not -w0: AgentCore's output stream silently drops
-    // any single line longer than ~64 KB. Buffer.from(..., 'base64') ignores the newlines.
-    const out = (await this.run(this.mustExist(p) + this.asUser(`base64 ${p}`, opts.user), path)).stdout
-    const raw = new Uint8Array(Buffer.from(out, 'base64'))
+    const size = Number((await this.run(this.mustExist(p) + this.asUser(`stat -L -c %s ${p}`, opts.user), path))
+      .stdout.trim().split(/\s+/).at(-1))
+    const parts: Buffer[] = []
+    for (let off = 0; off < size; off += READ_CHUNK)
+      parts.push(await this.readChunk(p, off, Math.min(READ_CHUNK, size - off), opts.user, path))
+    const raw = new Uint8Array(Buffer.concat(parts))
     switch (opts.format) {
       case 'bytes': return raw
       case 'blob': return new Blob([raw])
       case 'stream': return new ReadableStream<Uint8Array>({ start(c) { c.enqueue(raw); c.close() } })
       default: return new TextDecoder().decode(raw)
     }
+  }
+
+  /** `n` bytes at `off`, verified (see Sandbox._execOrdered); refetched if incomplete. */
+  private async readChunk(p: string, off: number, n: number, user: string | undefined, path: string): Promise<Buffer> {
+    const script = this.asUser(`tail -c +${off + 1} ${p} | head -c ${n} | base64 -w ${B64_LINE}`, user)
+    for (let i = 0; i < READ_RETRIES; i++) {
+      const text = await this.sbx._execOrdered(script, 120)
+      if (text === undefined) continue
+      const data = Buffer.from(text, 'base64')
+      if (data.length === n) return data
+    }
+    throw new SandboxError(`files.read('${path}'): output kept arriving incomplete at offset ${off}`)
   }
 
   /**
@@ -434,14 +480,18 @@ export class Sandbox {
 
   /** @internal */ readonly _cfg: Config
   /** @internal */ readonly _workdir?: string
+  /** @internal V2 runtime: one command call can wait at most V2_MAX_CALL_S */ readonly _v2: boolean
   private readonly rec: SandboxRecord
+  private readonly arn: string
   private readonly data: BedrockAgentCoreClient
 
   /** Use Sandbox.create / Sandbox.connect; the constructor does no I/O. */
   constructor(cfg: Config, rec: SandboxRecord) {
     this._cfg = cfg
     this.rec = rec
+    this.arn = rec.agent_runtime_arn ?? rec.harness_arn
     this._workdir = rec.workdir ?? undefined
+    this._v2 = rec.platform_version === 'V2'
     // requestTimeout must outlast the longest command: a command that prints nothing for a
     // long time must not be cut off by the HTTP client.
     this.data = new BedrockAgentCoreClient({
@@ -486,7 +536,11 @@ export class Sandbox {
       const started = Date.now() / 1000
       const rec: SandboxRecord = {
         sandbox_id: 'sbx' + randomUUID().replace(/-/g, ''), // 35 chars; runtimeSessionId needs >= 33
-        template: alias, harness_arn: tpl.harness_arn, workdir: tpl.workdir ?? null,
+        // The ARN commands go to: Harness ARN (V1) or Runtime ARN (V2). harness_arn is kept
+        // under its old name too, for SDK versions that only read that field.
+        template: alias, agent_runtime_arn: tpl.agent_runtime_arn ?? tpl.harness_arn!,
+        harness_arn: tpl.agent_runtime_arn ?? tpl.harness_arn!, platform_version: tpl.platform_version ?? 'V1',
+        workdir: tpl.workdir ?? null,
         metadata: opts.metadata ?? {}, started_at: started, end_at: started + cfg.maxLifetimeS,
       }
       const sbx = new this(cfg, rec)
@@ -554,7 +608,7 @@ export class Sandbox {
   private async stop(): Promise<boolean> {
     try {
       await this.data.send(new StopRuntimeSessionCommand({
-        agentRuntimeArn: this.rec.harness_arn, runtimeSessionId: this.sandboxId, qualifier: 'DEFAULT',
+        agentRuntimeArn: this.arn, runtimeSessionId: this.sandboxId, qualifier: 'DEFAULT',
       }))
       return true
     } catch (err) {
@@ -671,6 +725,38 @@ export class Sandbox {
   // --------------------------------------------------------------- transport
 
   /**
+   * Run an SDK-internal, read-only `script` and resolve to its stdout verified, or undefined.
+   *
+   * AgentCore streams stdout one line per event, and big outputs are not delivered reliably:
+   * on V1 and V2 the last lines can be lost when the command exits right after printing, and
+   * on V2 lines can also arrive out of order. So every line is numbered in the microVM (awk)
+   * and followed by an end line carrying the count; here the lines are put back in order and
+   * the reply is accepted only if every line 1..count is present. Callers retry on undefined.
+   * User commands (commands.run) cannot be fixed this way, since their output is the user's own.
+   * @internal
+   */
+  async _execOrdered(script: string, timeoutS: number): Promise<string | undefined> {
+    const r = await this._exec(`{ ${script}\n} | awk '{print NR":"$0} END{print "${END_MARK}:"NR}'`, timeoutS, { raw: true })
+    const lines = new Map<number, string>()
+    let total: number | undefined
+    for (const line of r.stdout.split('\n')) {
+      const k = line.indexOf(':')
+      if (k < 0) continue
+      const head = line.slice(0, k), body = line.slice(k + 1)
+      if (head === END_MARK && /^\d+$/.test(body)) total = Number(body)
+      else if (/^\d+$/.test(head)) lines.set(Number(head), body)
+    }
+    if (total === undefined || lines.size !== total) return undefined
+    let out = ''
+    for (let i = 1; i <= total; i++) {
+      const l = lines.get(i)
+      if (l === undefined) return undefined
+      out += l + '\n'
+    }
+    return out
+  }
+
+  /**
    * Run `script` with bash in the microVM: one InvokeAgentRuntimeCommand call.
    *
    * The script travels base64-encoded (no quoting issues), is written to a temp file and run
@@ -682,7 +768,8 @@ export class Sandbox {
     o: { onStdout?: CommandStartOpts['onStdout']; onStderr?: CommandStartOpts['onStderr']; raw?: boolean } = {},
   ): Promise<CommandResult> {
     const pre = o.raw ? '' : `[ -f ${STATE}/env ] && . ${STATE}/env\n`
-    const t = Math.max(1, Math.trunc(timeoutS))
+    let t = Math.max(1, Math.trunc(timeoutS))
+    if (this._v2) t = Math.min(t, V2_MAX_CALL_S) // Commands.run goes background past this
     const cmd = `/bin/sh -c 'f=$(mktemp); echo ${b64(pre + script)} | base64 -d > $f; ` +
       `timeout -k 5 ${t} bash $f; rc=$?; rm -f $f; exit $rc'`
     if (cmd.length > MAX_CMD)
@@ -692,7 +779,7 @@ export class Sandbox {
     for (let attempt = 0; ; attempt++) {
       try {
         resp = await this.data.send(new InvokeAgentRuntimeCommandCommand({
-          agentRuntimeArn: this.rec.harness_arn, runtimeSessionId: this.sandboxId, qualifier: 'DEFAULT',
+          agentRuntimeArn: this.arn, runtimeSessionId: this.sandboxId, qualifier: 'DEFAULT',
           contentType: 'application/json', accept: 'application/vnd.amazon.eventstream',
           body: { command: cmd, timeout: t + 30 },
         } as any))
